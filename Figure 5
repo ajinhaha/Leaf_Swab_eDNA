@@ -1,4 +1,19 @@
 # ================================================================
+# LEAF-SWAB eDNA | COMPLETE REPRODUCIBLE FIGURE 5 ANALYSIS
+# ================================================================
+# Run this entire script from top to bottom in a clean R session.
+# Each major operation has a preceding # explanation.
+# Inputs: Combined_12S_read_table.xlsx and Combined_16S_read_table.xlsx.
+# Output: figures5/ (PNG, PDF and supplementary CSV tables).
+# Statistical design: binary Sorensen, Cailliez PCoA, PERMANOVA,
+# dispersion, restricted within-plot height permutations, plot-pooled
+# location comparisons, pairwise tests and exploratory envfit.
+# IMPORTANT: zero-detection swabs are excluded; review this choice.
+# IMPORTANT: group ellipses show distribution, not centroid confidence.
+# IMPORTANT: location PERMANOVA may be affected by dispersion differences.
+# ================================================================
+
+# ================================================================
 # LEAF-SWAB eDNA | PCoA OF VERTEBRATE COMMUNITY COMPOSITION
 # ================================================================
 # PURPOSE
@@ -9,11 +24,15 @@
 #   OTU read counts -> curated taxa -> presence/absence (0/1).
 #   Sørensen dissimilarity is calculated directly from binary data
 #   using vegan::vegdist(comm, method = "bray", binary = TRUE).
+#   Do NOT apply Hellinger transformation before this calculation.
+#   PCoA uses a Cailliez additive correction where necessary.
+#   PERMANOVA and dispersion retain the original Sørensen distances.
 #
 # STATISTICAL DESIGN
 #   Height: permutations constrained within plot (repeated samples).
 #   Location: one pooled presence/absence observation per plot.
 #   PERMANOVA and dispersion test are distinct: check both results.
+#   Envfit: height permutations constrained within plots; location unrestricted.
 #   Envfit vectors are descriptive correlations, not causal effects.
 #
 # INPUT FILES (in working directory)
@@ -24,6 +43,7 @@
 # OUTPUT DIRECTORY: figures5
 #   Individual and combined plots in PNG and PDF formats.
 #   PERMANOVA, dispersion and envfit summaries in CSV format.
+#   All output files are created only when the script runs with input data.
 # ================================================================
 
 # 1. PACKAGES -----------------------------------------------------
@@ -33,10 +53,12 @@ required_packages <- c('dplyr', 'tidyr', 'readxl', 'ggplot2',
 # Identify packages that must be installed before running the script.
 missing_packages <- setdiff(required_packages,
                             rownames(installed.packages()))
+# Execute the following analysis or validation step.
 if (length(missing_packages)) {
   stop('Install required packages first: install.packages(c(',
        paste(sprintf('"%s"', missing_packages), collapse = ', '), '))')
 }
+# Execute the following analysis or validation step.
 invisible(lapply(required_packages, library, character.only = TRUE))
 
 # 2. PATHS AND REPRODUCIBILITY -----------------------------------
@@ -118,6 +140,8 @@ prepare_marker <- function(path, marker) {
   exclude <- grepl(excluded_pattern, notes, ignore.case = TRUE)
   exclude[is.na(exclude)] <- FALSE
   df <- df[!exclude, , drop = FALSE]
+  # Stop if curation leaves no taxonomic records.
+  if (!nrow(df)) stop('No retained OTUs in ', path)
   genus <- trimws(as.character(df$Genus))
   species <- trimws(as.character(df$Species))
   genus[genus %in% c('', 'NA', 'N/A')] <- NA_character_
@@ -128,8 +152,9 @@ prepare_marker <- function(path, marker) {
   df$Marker <- marker
   sample_cols <- setdiff(names(df), metadata_cols)
   # Remove any controls, including newly added PCR control columns.
-  sample_cols <- sample_cols[!grepl('^Control_', sample_cols,
-                                   ignore.case = TRUE)]
+  # Only accept sample names matching LOCATION_HEIGHT_PLOT.
+  # This excludes controls and unexpected metadata columns automatically.
+  sample_cols <- sample_cols[grepl('^.+_(Lower|Middle|Upper)_.+$', sample_cols)]
   if (!length(sample_cols)) stop('No sample columns found in ', path)
   for (nm in sample_cols) {
     val <- suppressWarnings(as.numeric(as.character(df[[nm]])))
@@ -177,6 +202,7 @@ storage.mode(incid) <- 'numeric'
 samples <- colnames(incid)
 # Define the expected LOCATION_HEIGHT_PLOT sample-name structure.
 pattern <- '^(.+)_(Lower|Middle|Upper)_(.+)$'
+# Execute the following analysis or validation step.
 if (any(!grepl(pattern, samples))) {
   stop('Sample names do not match LOCATION_HEIGHT_PLOT: ',
        paste(samples[!grepl(pattern, samples)], collapse = ', '))
@@ -195,23 +221,31 @@ info$PlotID <- paste(info$location, info$plot, sep = '_')
 info$height <- factor(info$height, levels = names(height_colors))
 # Order location levels consistently across analyses and legends.
 info$location <- factor(info$location, levels = names(location_colors))
+# Execute the following analysis or validation step.
 if (anyNA(info$height) || anyNA(info$location)) {
   stop('Unexpected height or location labels in sample names.')
 }
 # Identify samples with at least one detected taxon.
 keep <- colSums(incid) > 0
+# Execute the following analysis or validation step.
 if (any(!keep)) message('Excluding ', sum(!keep), ' zero-detection swabs.')
 # Remove samples with no taxa before calculating dissimilarities.
 incid <- incid[, keep, drop = FALSE]
+# Execute the next step and store its result in info.
 info <- info[match(colnames(incid), info$sample), , drop = FALSE]
+# Execute the following analysis or validation step.
 if (ncol(incid) < 3) stop('Too few nonempty samples for PCoA.')
 
 # 8. HELPER: ORDINATION AND EXPLAINED VARIATION -------------------
 # Sørensen dissimilarity on binary sample-by-taxon data.
-# Lingoes additive correction makes PCoA eigenvalues nonnegative.
+# Cailliez additive correction (cmdscale(add = TRUE)) handles negative eigenvalues.
+# The original Sørensen distances remain unchanged for hypothesis tests.
 # Compute Sørensen dissimilarities and the corrected two-axis PCoA.
+# No Hellinger transformation is used because binary Sørensen is required.
 make_ordination <- function(comm) {
+  # vegan's binary Bray-Curtis equals Sørensen dissimilarity.
   d <- vegan::vegdist(comm, method = 'bray', binary = TRUE)
+  # Cailliez correction is used only to display non-Euclidean distances.
   ord <- stats::cmdscale(d, k = 2, eig = TRUE, add = TRUE)
   if (is.null(dim(ord$points)) || ncol(ord$points) < 2) {
     stop('Ordination has fewer than two axes.')
@@ -232,6 +266,10 @@ make_ordination <- function(comm) {
 run_tests <- function(d, grouping, blocks = NULL) {
   group <- droplevels(factor(grouping))
   if (nlevels(group) < 2) stop('At least two groups required.')
+  if (length(group) != attr(d, 'Size')) stop('Grouping does not match distance matrix.')
+  if (!is.null(blocks) && length(blocks) != length(group)) {
+    stop('Permutation blocks do not match sample count.')
+  }
   if (is.null(blocks)) {
     design <- permute::how(nperm = n_permutations)
   } else {
@@ -239,7 +277,8 @@ run_tests <- function(d, grouping, blocks = NULL) {
                            blocks = factor(blocks))
   }
   ad <- vegan::adonis2(d ~ group, permutations = design)
-  bd <- vegan::betadisper(d, group)
+  # Bias adjustment is not used; test distances to group medians.
+  bd <- vegan::betadisper(d, group, type = 'median')
   bd_perm <- vegan::permutest(bd, permutations = design)
   list(permanova = ad, dispersion = bd_perm,
        permanova_p = ad$`Pr(>F)`[1],
@@ -247,14 +286,28 @@ run_tests <- function(d, grouping, blocks = NULL) {
 }
 
 # 10. HELPER: TAXON VECTORS --------------------------------------
-# Fit taxon presence vectors to the first two PCoA axes. The
-# displayed arrow length is scaled for legibility and is not a
-# direct measure of abundance. Colours follow aligned centroids.
-# Fit and select significant animal-taxon vectors for optional display.
+# Fit taxon presence vectors to the first two PCoA axes.
+# Height: 999 permutations constrained within plots.
+# Location: 999 unrestricted permutations of independent pooled plots.
+# Arrow direction indicates increasing taxon occurrence association.
+# Length scales with sqrt(r-squared), then is rescaled for plotting.
+# Arrows are descriptive, not causal or evidence of habitat preference.
+# Fit and select up to eight taxa with unadjusted P <= 0.05.
+# All fitted taxon p-values are also exported for transparent reporting.
 get_vectors <- function(ord, comm, scores_df, group_var,
-                        palette, top_n = 8) {
-  fit <- vegan::envfit(ord$points, comm,
-                       permutations = n_permutations, na.rm = TRUE)
+                        palette, top_n = 8, blocks = NULL) {
+  # Remove taxa with no occurrence variation (cannot fit vectors).
+  variable_taxa <- apply(comm, 2, function(x) length(unique(x)) > 1)
+  comm_fit <- comm[, variable_taxa, drop = FALSE]
+  if (!ncol(comm_fit)) return(data.frame())
+  # Use the same permutation restriction as the corresponding PERMANOVA.
+  permutation_design <- if (is.null(blocks)) {
+    permute::how(nperm = n_permutations)
+  } else {
+    permute::how(nperm = n_permutations, blocks = factor(blocks))
+  }
+  fit <- vegan::envfit(ord$points, comm_fit,
+                       permutations = permutation_design, na.rm = TRUE)
   if (is.null(fit$vectors) || !length(fit$vectors$pvals)) {
     return(data.frame())
   }
@@ -262,8 +315,9 @@ get_vectors <- function(ord, comm, scores_df, group_var,
   if (ncol(vec) < 2) return(data.frame())
   names(vec)[1:2] <- c('Dim1', 'Dim2')
   vec$Taxon <- rownames(vec)
-  vec$pval <- fit$vectors$pvals
-  vec$r2 <- fit$vectors$r
+  # Match p-values and squared correlations by taxon name, not row order.
+  vec$pval <- fit$vectors$pvals[vec$Taxon]
+  vec$r2 <- fit$vectors$r[vec$Taxon]
   vec <- vec[!is.na(vec$pval) & vec$pval <= 0.05, , drop = FALSE]
   vec <- vec[order(vec$pval, -vec$r2), , drop = FALSE]
   vec <- head(vec, top_n)
@@ -283,9 +337,10 @@ get_vectors <- function(ord, comm, scores_df, group_var,
     as.character(centroids$group[which.max(similarities)])
   }, character(1))
   vec$assigned_group <- best
-  # Scale vector directions by the square root of their correlation strength.
-  vec$Dim1 <- vec$Dim1 * sqrt(vec$r2)
-  vec$Dim2 <- vec$Dim2 * sqrt(vec$r2)
+  # Scale fitted direction vectors by sqrt(r2), then to plot dimensions.
+  # vegan::scores(envfit, display = 'vectors') already scales arrows by sqrt(r2).
+  # Do not multiply by sqrt(r2) again, which would exaggerate differences.
+  # Retain the proportional fitted-vector lengths before uniform plot scaling.
   span <- min(diff(range(scores_df$PCoA1)),
               diff(range(scores_df$PCoA2)))
   max_length <- max(sqrt(vec$Dim1^2 + vec$Dim2^2))
@@ -297,8 +352,31 @@ get_vectors <- function(ord, comm, scores_df, group_var,
   vec
 }
 
+# Export every fitted taxon's envfit statistics, not only plotted taxa.
+# This avoids treating the displayed top eight as the complete test results.
+get_all_envfit <- function(ord, comm, blocks = NULL) {
+  variable_taxa <- apply(comm, 2, function(x) length(unique(x)) > 1)
+  comm_fit <- comm[, variable_taxa, drop = FALSE]
+  if (!ncol(comm_fit)) {
+    return(data.frame(Taxon = character(), r2 = numeric(), p = numeric()))
+  }
+  design <- if (is.null(blocks)) {
+    permute::how(nperm = n_permutations)
+  } else {
+    permute::how(nperm = n_permutations, blocks = factor(blocks))
+  }
+  fit <- vegan::envfit(ord$points, comm_fit, permutations = design)
+  out <- data.frame(
+    Taxon = names(fit$vectors$pvals),
+    r2 = as.numeric(fit$vectors$r[names(fit$vectors$pvals)]),
+    p = as.numeric(fit$vectors$pvals),
+    row.names = NULL
+  )
+  out[order(out$p, -out$r2), , drop = FALSE]
+}
+
 # 11. HELPER: DRAW PCOA WITH LARGER TEXT --------------------------
-# Draw points, confidence ellipses, test labels and optional taxon arrows.
+# Draw points, 95% group data ellipses (not confidence regions for centroids), test labels and optional taxon arrows.
 make_plot <- function(scores_df, vectors, group_var, palette,
                       explained, stats, legend_title) {
   p_text <- paste0('PERMANOVA p = ',
@@ -352,7 +430,8 @@ stats_height <- run_tests(ord_height$distance, info$height,
                           blocks = info$PlotID)
 # Identify taxa associated with the height-level ordination.
 vectors_height <- get_vectors(ord_height$ord, comm_height,
-                              scores_height, 'height', height_colors)
+                              scores_height, 'height', height_colors,
+                              blocks = info$PlotID)
 # Create the clean height panel without taxon vectors.
 p_height <- make_plot(scores_height, vectors_height[0, , drop = FALSE], 'height',
                       height_colors, ord_height$explained,
@@ -373,7 +452,9 @@ pooled[pooled > 0] <- 1
 info_plot <- info %>%
   dplyr::distinct(PlotID, location) %>%
   dplyr::mutate(sample = PlotID)
+# Execute the next step and store its result in info_plot.
 info_plot <- info_plot[match(rownames(pooled), info_plot$sample), , drop = FALSE]
+# Validate the required data objects before continuing.
 stopifnot(!anyNA(info_plot$location))
 # Calculate the plot-level Sørensen PCoA for location comparisons.
 ord_location <- make_ordination(pooled)
@@ -416,6 +497,7 @@ format_bottom_legend <- function(plot, title) {
 p_height <- format_bottom_legend(p_height, 'Vegetation height')
 # Create the height panel with significant taxon vectors.
 p_height_vectors <- format_bottom_legend(p_height_vectors, 'Vegetation height')
+# Execute the next step and store its result in p_location.
 p_location <- format_bottom_legend(p_location, 'Location')
 # Create the location panel with significant taxon vectors.
 p_location_vectors <- format_bottom_legend(p_location_vectors, 'Location')
@@ -456,13 +538,18 @@ save_figure <- function(plot, filename, width, height) {
 
 # Save clean individual panels and taxon-vector versions.
 save_figure(p_height, 'PCoA_A_Vegetation_Height', 11, 8)
+# Execute the following analysis or validation step.
 save_figure(p_location, 'PCoA_B_Location_Pooled_By_Plot', 11, 8)
+# Execute the following analysis or validation step.
 save_figure(p_height_vectors, 'Supplement_PCoA_Height_Vectors', 11, 8)
+# Execute the following analysis or validation step.
 save_figure(p_location_vectors, 'Supplement_PCoA_Location_Vectors', 11, 8)
 
 # Save the primary side-by-side, vertical, and clean combinations.
 save_figure(combined_fig, 'PCoA_Combined_AB_Side_by_Side_With_Taxa', 22, 9)
+# Execute the following analysis or validation step.
 save_figure(combined_fig_vertical, 'PCoA_Combined_AB_Vertical_With_Taxa', 12, 17)
+# Execute the following analysis or validation step.
 save_figure(combined_clean, 'PCoA_Combined_AB_Side_by_Side_Clean', 22, 9)
 
 # 17. EXPORT STATISTICAL RESULTS ---------------------------------
@@ -481,15 +568,294 @@ summary_tests <- data.frame(
                    stats_location$dispersion_p)
 )
 
-# Export the test summary and significant taxon vectors to CSV files.
+# Export the test summary, plotted vectors, and all taxon tests to CSV files.
 write.csv(summary_tests, file.path(output_dir, 'PCoA_Statistical_Summary.csv'),
           row.names = FALSE)
+# Save the corresponding results table to the output directory.
 write.csv(vectors_height, file.path(output_dir, 'Envfit_Height_Vectors.csv'),
           row.names = FALSE)
+# Save the corresponding results table to the output directory.
 write.csv(vectors_location, file.path(output_dir, 'Envfit_Location_Vectors.csv'),
           row.names = FALSE)
+
+# Export complete envfit tables with the correct permutation designs.
+write.csv(get_all_envfit(ord_height$ord, comm_height, blocks = info$PlotID),
+          file.path(output_dir, 'Envfit_Height_All_Taxa.csv'), row.names = FALSE)
+# Save the corresponding results table to the output directory.
+write.csv(get_all_envfit(ord_location$ord, pooled),
+          file.path(output_dir, 'Envfit_Location_All_Taxa.csv'), row.names = FALSE)
 
 # Report the final output directory in the R console.
 message('Done. Figures and statistical tables saved to: ',
         normalizePath(output_dir))
 
+# ================================================================
+# 18. PAIRWISE HEIGHT PERMANOVA — SUPPLEMENTARY TABLE
+# ================================================================
+# Compare all three height pairs using only complete paired plots.
+# Restrict all permutations within plots and apply BH correction.
+# 4. Define the three planned comparisons.
+height_pairs <- list(
+  c("Lower", "Middle"),
+  c("Lower", "Upper"),
+  c("Middle", "Upper")
+)
+
+# 5. Perform a separate restricted-permutation PERMANOVA for each pair.
+run_pairwise_height <- function(pair) {
+  # Keep only samples from the two vegetation heights under comparison.
+  selected <- as.character(info$height) %in% pair
+  metadata <- info[selected, , drop = FALSE]
+  community <- comm_height[selected, , drop = FALSE]
+  
+  # Retain complete plots with one sample from each of the two heights.
+  counts <- table(metadata$PlotID, factor(metadata$height, levels = pair))
+  complete_plots <- rownames(counts)[rowSums(counts == 1L) == 2L]
+  keep <- metadata$PlotID %in% complete_plots
+  metadata <- metadata[keep, , drop = FALSE]
+  community <- community[keep, , drop = FALSE]
+  
+  # Require at least two complete plots for a meaningful comparison.
+  if (length(complete_plots) < 2L) {
+    stop("Too few complete plots for comparison: ", paste(pair, collapse = " vs "))
+  }
+  
+  # Recreate the binary factor and check alignment after subsetting.
+  metadata$height <- factor(as.character(metadata$height), levels = pair)
+  stopifnot(identical(rownames(community), as.character(metadata$sample)))
+  
+  # Compute Sørensen dissimilarity from the binary community matrix.
+  distance <- vegan::vegdist(community, method = "bray", binary = TRUE)
+  
+  # Restrict permutation of height labels within each paired plot.
+  permutation_design <- permute::how(
+    nperm = n_permutations,
+    blocks = factor(metadata$PlotID)
+  )
+  
+  # Run PERMANOVA with height as the sole predictor.
+  model <- vegan::adonis2(
+    distance ~ height,
+    data = metadata,
+    permutations = permutation_design
+  )
+  
+  # Extract the first (height) row of the PERMANOVA results.
+  data.frame(
+    Comparison = paste(pair, collapse = " vs "),
+    Plots = length(complete_plots),
+    Samples = nrow(metadata),
+    Df = model$Df[1],
+    Pseudo_F = model$F[1],
+    R2 = model$R2[1],
+    P_value = model$`Pr(>F)`[1],
+    stringsAsFactors = FALSE
+  )
+}
+
+# 6. Combine results for the three comparisons.
+pairwise_height_results <- do.call(
+  rbind,
+  lapply(height_pairs, run_pairwise_height)
+)
+
+# 7. Adjust all three raw P-values for multiple comparisons (BH method).
+pairwise_height_results$Adjusted_P_BH <- p.adjust(
+  pairwise_height_results$P_value,
+  method = "BH"
+)
+
+# 8. Add a conventional significance flag based on adjusted P-values.
+pairwise_height_results$Significant_BH_0_05 <-
+  pairwise_height_results$Adjusted_P_BH <= 0.05
+
+# 9. Save the full-precision results for Supplementary Table SX.
+output_file <- file.path(output_dir, "Supplementary_Table_SX_Pairwise_PERMANOVA_Height.csv")
+# Save the corresponding results table to the output directory.
+write.csv(pairwise_height_results, output_file, row.names = FALSE)
+
+# 10. Display the table in the R console.
+print(pairwise_height_results, row.names = FALSE)
+# Execute the following analysis or validation step.
+message("Supplementary Table SX saved to: ", normalizePath(output_file))
+
+# NOTE: If some plots have missing heights, this complete-pair analysis can
+# use a different sample set from the overall height PERMANOVA. Report the
+# number of plots per comparison in Supplementary Table SX.
+
+# ================================================================
+# 19. LOCATION-LEVEL SUPPLEMENTARY TESTS
+# ================================================================
+# The pooled plot-by-taxon matrix and aligned metadata already exist.
+# Run ten pairwise location comparisons with Holm adjustment.
+# Run pairwise dispersion tests to assess differences in variability.
+# Export overall group dispersion and all taxon associations.
+# Reuse the 999-permutation setting established above.
+
+# 2. DEFINE ALL 10 PAIRS OF THE FIVE SAMPLING LOCATIONS ----------------------
+locations <- c('SWN', 'BBI', 'SBJ', 'KRB', 'SLP')
+# Validate the required data objects before continuing.
+stopifnot(setequal(unique(as.character(info_plot$location)), locations))
+# Execute the next step and store its result in location_pairs.
+location_pairs <- combn(locations, 2, simplify = FALSE)
+
+# 3. PAIRWISE PERMANOVA USING BINARY SORENSEN DISSIMILARITY ------------------
+# Each comparison uses only the plots belonging to the two locations.
+# Because plots are independent, permutation labels are unrestricted.
+run_location_pair <- function(pair) {
+  keep <- as.character(info_plot$location) %in% pair
+  meta <- info_plot[keep, , drop = FALSE]
+  comm <- pooled[keep, , drop = FALSE]
+  meta$location <- factor(as.character(meta$location), levels = pair)
+  stopifnot(identical(rownames(comm), as.character(meta$sample)))
+  d <- vegan::vegdist(comm, method = 'bray', binary = TRUE)
+  model <- vegan::adonis2(d ~ location, data = meta, permutations = n_permutations)
+  data.frame(Comparison = paste(pair, collapse = ' vs '),
+             N_1 = sum(meta$location == pair[1]),
+             N_2 = sum(meta$location == pair[2]),
+             Plots = nrow(meta),
+             Df = model$Df[1],
+             Pseudo_F = model$F[1],
+             R2 = model$R2[1],
+             P_value = model$`Pr(>F)`[1])
+}
+# Execute the next step and store its result in location_pairwise.
+location_pairwise <- do.call(rbind, lapply(location_pairs, run_location_pair))
+# Execute the next step and store its result in location_pairwise$Adjusted_P_Holm.
+location_pairwise$Adjusted_P_Holm <- p.adjust(location_pairwise$P_value,
+                                              method = 'holm')
+# Execute the next step and store its result in location_pairwise$Significant_Holm_0_05.
+location_pairwise$Significant_Holm_0_05 <-
+  location_pairwise$Adjusted_P_Holm <= 0.05
+# Save the corresponding results table to the output directory.
+write.csv(location_pairwise,
+          file.path(output_dir, 'Supplementary_Location_Pairwise_PERMANOVA.csv'),
+          row.names = FALSE)
+
+# 4. OVERALL LOCATION DISPERSION: DISTANCE TO GROUP MEDIAN ------------------
+# vegan::betadisper defaults to type='median'; specify explicitly.
+# These means summarize the FULL five-location ordination, not a pairwise
+# re-fitted dispersion analysis.
+full_distance <- vegan::vegdist(pooled, method = 'bray', binary = TRUE)
+# Execute the next step and store its result in full_group.
+full_group <- droplevels(factor(info_plot$location, levels = locations))
+# Execute the next step and store its result in full_bd.
+full_bd <- vegan::betadisper(full_distance, full_group, type = 'median')
+# Execute the next step and store its result in overall_dispersion.
+overall_dispersion <- data.frame(
+  Location = locations,
+  N_plots = as.integer(table(full_group)[locations]),
+  Mean_distance_to_median = as.numeric(tapply(full_bd$distances,
+                                              full_group, mean)[locations]),
+  SD_distance_to_median = as.numeric(tapply(full_bd$distances,
+                                            full_group, sd)[locations]))
+# Save the corresponding results table to the output directory.
+write.csv(overall_dispersion,
+          file.path(output_dir, 'Supplementary_Location_Overall_Dispersion.csv'),
+          row.names = FALSE)
+
+# 5. PAIRWISE DISPERSION TESTS ----------------------------------------------
+# Re-fit betadisper for each two-location subset so that the test is based
+# on the medians of those two groups; test with 999 permutations.
+# These tests address differences in within-group variability, not centroid
+# separation. Holm correction is applied across the 10 comparisons.
+run_dispersion_pair <- function(pair) {
+  keep <- as.character(info_plot$location) %in% pair
+  meta <- info_plot[keep, , drop = FALSE]
+  comm <- pooled[keep, , drop = FALSE]
+  group <- factor(as.character(meta$location), levels = pair)
+  d <- vegan::vegdist(comm, method = 'bray', binary = TRUE)
+  bd <- vegan::betadisper(d, group, type = 'median')
+  test <- vegan::permutest(bd, permutations = n_permutations)
+  means <- tapply(bd$distances, group, mean)
+  data.frame(Comparison = paste(pair, collapse = ' vs '),
+             Location_1 = pair[1], Location_2 = pair[2],
+             N_1 = sum(group == pair[1]), N_2 = sum(group == pair[2]),
+             Mean_dispersion_1 = unname(means[pair[1]]),
+             Mean_dispersion_2 = unname(means[pair[2]]),
+             Difference_1_minus_2 = unname(means[pair[1]] - means[pair[2]]),
+             F = unname(test$tab[1, 'F']),
+             P_value = unname(test$tab[1, 'Pr(>F)']))
+}
+# Execute the next step and store its result in location_dispersion_pairs.
+location_dispersion_pairs <- do.call(rbind,
+                                     lapply(location_pairs, run_dispersion_pair))
+# Execute the next step and store its result in location_dispersion_pairs$Adjusted_P_Holm.
+location_dispersion_pairs$Adjusted_P_Holm <-
+  p.adjust(location_dispersion_pairs$P_value, method = 'holm')
+# Execute the next step and store its result in location_dispersion_pairs$Significant_Holm_0_05.
+location_dispersion_pairs$Significant_Holm_0_05 <-
+  location_dispersion_pairs$Adjusted_P_Holm <= 0.05
+# Save the corresponding results table to the output directory.
+write.csv(location_dispersion_pairs,
+          file.path(output_dir, 'Supplementary_Location_Pairwise_Dispersion.csv'),
+          row.names = FALSE)
+
+# 6. ALL TAXON ENVFIT ASSOCIATIONS ------------------------------------------
+# envfit treats each binary taxon as a numeric vector (0/1). Fit all taxa
+# with variable occurrence; constant taxa cannot yield informative vectors.
+# Permutations are unrestricted because plot-level observations are independent.
+variable_taxa <- apply(pooled, 2, function(x) length(unique(x)) > 1)
+# Execute the next step and store its result in comm_envfit.
+comm_envfit <- pooled[, variable_taxa, drop = FALSE]
+# Execute the following analysis or validation step.
+set.seed(2026) # Keep the supplementary envfit permutation results reproducible.
+# Execute the next step and store its result in fit.
+fit <- vegan::envfit(ord_location$ord$points, comm_envfit,
+                     permutations = n_permutations, na.rm = TRUE)
+# Execute the next step and store its result in vec.
+vec <- as.data.frame(vegan::scores(fit, display = 'vectors', choices = 1:2))
+# Execute the next step and store its result in names(vec)[1:2].
+names(vec)[1:2] <- c('PCoA1_direction', 'PCoA2_direction')
+# Execute the next step and store its result in vec$Taxon.
+vec$Taxon <- rownames(vec)
+# Execute the next step and store its result in vec$R2.
+vec$R2 <- unname(fit$vectors$r[vec$Taxon])
+# Execute the next step and store its result in vec$P_value.
+vec$P_value <- unname(fit$vectors$pvals[vec$Taxon])
+# Execute the next step and store its result in vec$BH_adjusted_P_exploratory.
+vec$BH_adjusted_P_exploratory <- p.adjust(vec$P_value, method = 'BH')
+# Execute the next step and store its result in vec$Significant_unadjusted_0_05.
+vec$Significant_unadjusted_0_05 <- vec$P_value <= 0.05
+# Execute the next step and store its result in vec.
+vec <- vec[, c('Taxon', 'PCoA1_direction', 'PCoA2_direction',
+               'R2', 'P_value', 'BH_adjusted_P_exploratory',
+               'Significant_unadjusted_0_05')]
+# Execute the next step and store its result in vec.
+vec <- vec[order(vec$P_value, -vec$R2), , drop = FALSE]
+# Save the corresponding results table to the output directory.
+write.csv(vec, file.path(output_dir,
+                         'Supplementary_Location_Envfit_All_Taxa.csv'),
+          row.names = FALSE)
+# Save the corresponding results table to the output directory.
+write.csv(vec[vec$Significant_unadjusted_0_05, , drop = FALSE],
+          file.path(output_dir,
+                    'Supplementary_Location_Envfit_Significant_Taxa.csv'),
+          row.names = FALSE)
+
+# 7. OVERALL PERMANOVA STATISTICS -------------------------------------------
+# Extract the global location model's pseudo-F, R2, and P-value.
+overall_permanova <- data.frame(
+  Term = 'Location', N_plots = nrow(pooled),
+  Pseudo_F = stats_location$permanova$F[1],
+  R2 = stats_location$permanova$R2[1],
+  P_value = stats_location$permanova_p,
+  Dispersion_P_value = stats_location$dispersion_p)
+# Save the corresponding results table to the output directory.
+write.csv(overall_permanova,
+          file.path(output_dir, 'Supplementary_Location_Overall_PERMANOVA.csv'),
+          row.names = FALSE)
+
+# 8. PRINT RESULTS FOR MANUSCRIPT CHECKING ---------------------------------
+print(overall_permanova, row.names = FALSE)
+# Display this result in the R console.
+print(location_pairwise, row.names = FALSE)
+# Display this result in the R console.
+print(overall_dispersion, row.names = FALSE)
+# Display this result in the R console.
+print(location_dispersion_pairs, row.names = FALSE)
+# Execute the following analysis or validation step.
+message('Location supplementary analyses saved in: ', normalizePath(output_dir))
+
+# Confirm that all figures and supplementary tables have been written.
+message("Complete: main Figure 5 and all supplementary analyses in ", normalizePath(output_dir))
