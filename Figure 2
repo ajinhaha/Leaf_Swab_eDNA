@@ -1,0 +1,668 @@
+# ================================================================
+# LEAF-SWAB eDNA: FOUR-PANEL SEQUENCING AND TAXONOMY FIGURE
+# ================================================================
+# PURPOSE
+#   Panel A: per-sample proportions of 12S, 16S and unassigned reads
+#   Panel B: input OTUs retained or excluded by filtering category
+#   Panel C: percent identity of retained OTUs
+#   Panel D: taxonomic richness by marker and combined dataset
+#
+# INPUT FILES (place in working directory below)
+#   Reads_Metadata.csv (semicolon-delimited)
+#   Combined_12S_read_table.xlsx
+#   Combined_16S_read_table.xlsx
+#
+# OUTPUTS (automatically written to figures2/)
+#   Four individual PNG panels and one combined PNG figure
+#   Overall_Read_Summary.csv
+#   Panel_B_OTU_Filtering_Summary.xlsx (4 sheets)
+#
+# BEFORE RUNNING
+#   1. Install required R packages, including openxlsx.
+#   2. Update setwd() to your own analysis directory.
+#   3. Check that Note categories use the exact exclusion labels.
+#   4. Filtering priority for multiple Note labels is listed in
+#      filter_categories; the first matching category is assigned.
+#   5. Counts refer to OTU-table rows, not read abundance.
+# ================================================================
+
+# ==========================================================
+# FOUR-PANEL FIGURE
+# A = Read proportions
+# B = OTU filtering summary (stacked bar plot)
+# C = Percent identity distributions
+# D = Taxonomic richness
+# ==========================================================
+
+
+# ==========================================================
+# 1. LOAD PACKAGES
+# ==========================================================
+library(tidyverse)
+library(readxl)
+library(gghalves)
+library(patchwork)
+library(scales)
+library(openxlsx)  # Export OTU filtering and sequencing summaries to Excel
+
+
+# ==========================================================
+# 2. SET WORKING DIRECTORY
+# ==========================================================
+setwd("C:/Users/Fajrin/Desktop/Analysis_manuscript/")
+
+
+# ==========================================================
+# 3. CREATE OUTPUT FOLDER
+# ==========================================================
+dir.create("figures2", showWarnings = FALSE)
+
+
+# ==========================================================
+# 4. COLOURS AND FIGURE THEME
+# ==========================================================
+marker_colours <- c(
+  "12S"        = "#4878A8",
+  "16S"        = "#C47A43",
+  "Combined"   = "#8064A2",
+  "Unassigned" = "#A9ADB2"
+)
+
+otu_colours <- c(
+  "Retained_OTUs" = "#648F83",
+  "Control" = "#8DB9D2",
+  "No_Borneo_Record" = "#C7A66D",
+  "No_Taxa" = "#B8B8B8",
+  "Below_Genus" = "#777E87",
+  "NUMTs" = "#8C79A8",
+  "Human" = "#D5A5A0",
+  "Domestic_Animal" = "#A7B99B"
+)
+
+publication_theme <- theme_classic(base_size = 20) +
+  theme(
+    axis.title = element_text(size = 22, face = "bold", colour = "black"),
+    axis.text = element_text(size = 19, colour = "black"),
+    axis.line = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm"),
+    legend.title = element_text(size = 19, face = "bold"),
+    legend.text = element_text(size = 18, colour = "black"),
+    legend.key.size = unit(0.95, "cm"),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+
+# ==========================================================
+# 5. HELPER FUNCTIONS
+# ==========================================================
+clean_taxonomy <- function(df) {
+  df %>%
+    mutate(
+      Genus = trimws(as.character(Genus)),
+      Species = trimws(as.character(Species)),
+      Genus = na_if(Genus, ""),
+      Species = na_if(Species, ""),
+      Genus = na_if(Genus, "NA"),
+      Species = na_if(Species, "NA"),
+      Taxon = case_when(
+        !is.na(Species) ~ Species,
+        !is.na(Genus) ~ paste0(Genus, "_sp."),
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    select(-any_of(c("Note", "ID", "Seq", "Perc_ID", "English_Name")))
+}
+
+collapse_by_taxon <- function(df) {
+  df %>%
+    filter(!is.na(Taxon)) %>%
+    group_by(Taxon) %>%
+    summarise(
+      Class = first(na.omit(Class)),
+      Order = first(na.omit(Order)),
+      Family = first(na.omit(Family)),
+      Genus = first(na.omit(Genus)),
+      Species = first(na.omit(Species)),
+      IUCN = first(na.omit(IUCN)),
+      Marker = first(Marker),
+      N_otu_collapse = n(),
+      across(where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}
+
+filter_retained_otus <- function(df) {
+  excluded_notes <- paste(
+    c(
+      "Control", "No_Borneo_Record", "No_Taxa", "Below_Genus",
+      "NUMTs", "Human", "Domestic_Animal"
+    ),
+    collapse = "|"
+  )
+  
+  control_columns <- c(
+    "Control_Laboratory_Swab", "Control_Negative_Extraction",
+    "Control_PCR_Lib1", "Control_PCR_Lib3", "Control_PCR_Lib4",
+    "Control_PCR_Lib5", "Control_PCR_Lib6", "Control_PCR_Lib7",
+    "Control_PCR_Lib8", "Control_PCR_Lib9", "Control_PCR_Lib10",
+    "Control_PCR_Lib11", "Control_PCR_Lib12", "Control_PCR_Lib13",
+    "Control_Positive_Swab"
+  )
+  
+  df %>%
+    filter(is.na(Note) | !str_detect(Note, regex(excluded_notes, ignore_case = TRUE))) %>%
+    select(-any_of(control_columns))
+}
+
+
+# ==========================================================
+# 6. READ INPUT DATA
+# ==========================================================
+reads_df <- read_delim(
+  "Reads_Metadata.csv",
+  delim = ";",
+  trim_ws = TRUE,
+  col_types = cols(.default = col_character())
+)
+
+names(reads_df) <- trimws(names(reads_df))
+
+# Check that all required columns are present before continuing.
+required_read_columns <- c(
+  "sample_ID", "total_reads",
+  "12S_reads", "12S_reads_%",
+  "16S_reads", "16S_reads_%",
+  "unassign_reads", "unassign_reads_%"
+)
+
+missing_read_columns <- setdiff(required_read_columns, names(reads_df))
+
+if (length(missing_read_columns) > 0) {
+  stop(
+    paste0(
+      "The following columns are missing from Reads_Metadata.csv: ",
+      paste(missing_read_columns, collapse = ", "),
+      "\nColumns found in the file: ",
+      paste(names(reads_df), collapse = ", ")
+    )
+  )
+}
+
+otu_12S_raw <- read_excel("Combined_12S_read_table.xlsx")
+otu_16S_raw <- read_excel("Combined_16S_read_table.xlsx")
+
+
+# ==========================================================
+# 7. PANEL A: READ PROPORTIONS
+# ==========================================================
+reads_df <- reads_df %>%
+  mutate(
+    across(
+      c(
+        total_reads,
+        `12S_reads`, `12S_reads_%`,
+        `16S_reads`, `16S_reads_%`,
+        unassign_reads, `unassign_reads_%`
+      ),
+      ~ parse_number(na_if(.x, "-"))
+    )
+  )
+
+
+# ==========================================================
+# OVERALL SEQUENCING SUMMARY
+# ==========================================================
+# Percentages are calculated from the summed read counts,
+# rather than by averaging the percentages among samples.
+
+total_reads <- sum(reads_df$total_reads, na.rm = TRUE)
+total_12S_reads <- sum(reads_df$`12S_reads`, na.rm = TRUE)
+total_16S_reads <- sum(reads_df$`16S_reads`, na.rm = TRUE)
+total_unassigned_reads <- sum(reads_df$unassign_reads, na.rm = TRUE)
+
+read_summary <- tibble(
+  Category = c(
+    "Total reads",
+    "12S reads",
+    "16S reads",
+    "Unassigned reads"
+  ),
+  Reads = c(
+    total_reads,
+    total_12S_reads,
+    total_16S_reads,
+    total_unassigned_reads
+  ),
+  Percentage = c(
+    100,
+    (total_12S_reads / total_reads) * 100,
+    (total_16S_reads / total_reads) * 100,
+    (total_unassigned_reads / total_reads) * 100
+  )
+)
+
+# Display the sequencing summary in the R console.
+read_summary_display <- read_summary %>%
+  mutate(
+    Reads = comma(Reads, accuracy = 1),
+    Percentage = paste0(number(Percentage, accuracy = 0.01), "%")
+  )
+
+print(read_summary_display)
+
+# Export the numeric summary for tables or supplementary information.
+write_csv(
+  read_summary,
+  "figures2/Overall_Read_Summary.csv"
+)
+
+sample_order <- reads_df %>%
+  arrange(desc(`12S_reads_%`)) %>%
+  pull(sample_ID)
+
+reads_long <- reads_df %>%
+  select(sample_ID, `12S_reads_%`, `16S_reads_%`, `unassign_reads_%`) %>%
+  pivot_longer(
+    cols = -sample_ID,
+    names_to = "Category",
+    values_to = "Proportion"
+  ) %>%
+  mutate(
+    Category = recode(
+      Category,
+      `12S_reads_%` = "12S",
+      `16S_reads_%` = "16S",
+      `unassign_reads_%` = "Unassigned"
+    ),
+    Category = factor(Category, levels = c("12S", "16S", "Unassigned")),
+    sample_ID = factor(sample_ID, levels = sample_order)
+  )
+
+p_a <- ggplot(
+  reads_long,
+  aes(x = sample_ID, y = Proportion, fill = Category)
+) +
+  geom_col(
+    position = "fill",
+    na.rm = TRUE
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.25),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  labs(x = NULL, y = "Read proportion", fill = NULL) +
+  publication_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "top",
+    legend.direction = "horizontal"
+  )
+
+p_a
+
+
+# ==========================================================
+# 8. PANEL B: OTU FILTERING SUMMARY
+# ==========================================================
+# ==========================================================
+# PANEL B: CLASSIFY EACH INPUT OTU EXACTLY ONCE
+# ==========================================================
+# An OTU is a row in the original marker-specific read table.
+# The Note column records reasons for exclusion.
+# If multiple reasons occur in one Note, assign the first match
+# according to the priority order below. This avoids double counting.
+# Retained_OTUs includes rows with no matching exclusion reason.
+# The same exclusions are applied later to panels C and D.
+# IMPORTANT: These are OTU counts, not read counts or unique taxa.
+
+filter_categories <- c(
+  "Control", "No_Borneo_Record", "No_Taxa", "Below_Genus",
+  "NUMTs", "Human", "Domestic_Animal"
+)
+
+classify_otus <- function(df, marker_name) {
+  if (!"Note" %in% names(df)) {
+    stop(paste("Missing Note column in", marker_name, "OTU table"))
+  }
+  notes <- as.character(df$Note)
+  category <- rep("Retained_OTUs", nrow(df))
+  # First matching exclusion reason takes precedence.
+  for (reason in rev(filter_categories)) {
+    category[str_detect(coalesce(notes, ""), regex(reason, ignore_case = TRUE))] <- reason
+  }
+  tibble(Marker = marker_name, OTU_Row = seq_len(nrow(df)),
+         Note = notes, Category = category)
+}
+
+classified_otus <- bind_rows(
+  classify_otus(otu_12S_raw, "12S"),
+  classify_otus(otu_16S_raw, "16S")
+)
+
+# Include zero-count categories so all categories appear in Excel.
+plot_b_df <- classified_otus %>%
+  count(Marker, Category, name = "Count") %>%
+  complete(Marker = c("12S", "16S"),
+           Category = c("Retained_OTUs", filter_categories),
+           fill = list(Count = 0)) %>%
+  mutate(
+    Marker = factor(Marker, levels = c("12S", "16S")),
+    Category = factor(Category, levels = c(
+      "Domestic_Animal", "Human", "NUMTs", "Below_Genus",
+      "No_Taxa", "No_Borneo_Record", "Control", "Retained_OTUs"
+    ))
+  )
+
+# Verify every input OTU is represented exactly once.
+stopifnot(sum(plot_b_df$Count) == nrow(otu_12S_raw) + nrow(otu_16S_raw))
+
+# ==========================================================
+# EXPORT PANEL B OTU COUNTS TO A MULTI-SHEET EXCEL WORKBOOK
+# ==========================================================
+# Sheet 1: counts and percentages for each category by marker.
+# Sheet 2: marker-level retained/removed/total OTU summary.
+# Sheet 3: original Note and assigned category for each OTU.
+# Sheet 4: sequencing read counts and percentages.
+# Percentages are calculated within each marker, not across markers.
+
+otu_filter_excel <- plot_b_df %>%
+  mutate(Marker = as.character(Marker), Category = as.character(Category)) %>%
+  group_by(Marker) %>%
+  mutate(Total_OTUs = sum(Count), Percentage = if_else(
+    Total_OTUs > 0, 100 * Count / Total_OTUs, NA_real_
+  )) %>%
+  ungroup() %>%
+  select(Marker, Category, Count, Total_OTUs, Percentage) %>%
+  arrange(Marker, desc(Category == "Retained_OTUs"), Category)
+
+otu_filter_overview <- classified_otus %>%
+  group_by(Marker) %>%
+  summarise(
+    Total_OTUs = n(),
+    Retained_OTUs = sum(Category == "Retained_OTUs"),
+    Removed_OTUs = sum(Category != "Retained_OTUs"),
+    Retained_Percent = 100 * Retained_OTUs / Total_OTUs,
+    Removed_Percent = 100 * Removed_OTUs / Total_OTUs,
+    .groups = "drop"
+  )
+
+# Ensure the summary and plotted counts agree with actual filtering.
+stopifnot(
+  sum(otu_filter_overview$Retained_OTUs) ==
+    nrow(filter_retained_otus(otu_12S_raw)) +
+    nrow(filter_retained_otus(otu_16S_raw))
+)
+
+excel_path <- "figures2/Panel_B_OTU_Filtering_Summary.xlsx"
+wb <- createWorkbook()
+addWorksheet(wb, "Filtering_by_Category")
+addWorksheet(wb, "Filtering_Overview")
+addWorksheet(wb, "OTU_Classification")
+addWorksheet(wb, "Sequencing_Reads")
+writeDataTable(wb, "Filtering_by_Category", otu_filter_excel)
+writeDataTable(wb, "Filtering_Overview", otu_filter_overview)
+writeDataTable(wb, "OTU_Classification", classified_otus)
+writeDataTable(wb, "Sequencing_Reads", read_summary)
+for (sheet_name in names(wb)) {
+  freezePane(wb, sheet_name, firstRow = TRUE)
+  setColWidths(wb, sheet_name, cols = 1:8, widths = "auto")
+}
+saveWorkbook(wb, excel_path, overwrite = TRUE)
+message("Excel summary saved: ", excel_path)
+print(otu_filter_overview)
+print(otu_filter_excel)
+
+# ==========================================================
+# DRAW PANEL B: STACKED OTU COUNTS BY MARKER AND CATEGORY
+# ==========================================================
+
+p_b <- ggplot(
+  plot_b_df,
+  aes(x = Marker, y = Count, fill = Category)
+) +
+  geom_col(
+    colour = "black",
+    linewidth = 0.3,
+    width = 0.68
+  ) +
+  geom_text(
+    data = plot_b_df %>% filter(Category == "Retained_OTUs"),
+    aes(label = Count),
+    position = position_stack(vjust = 0.5),
+    size = 5.5,
+    fontface = "bold",
+    colour = "white"
+  ) +
+  scale_fill_manual(
+    values = otu_colours,
+    breaks = c(
+      "Retained_OTUs", "Control", "No_Borneo_Record", "No_Taxa",
+      "Below_Genus", "NUMTs", "Human", "Domestic_Animal"
+    ),
+    labels = c(
+      "Retained OTUs", "Controls", "No Borneo record",
+      "No taxonomic assignment", "Below genus level", "NUMTs",
+      "Human", "Domestic animals"
+    ),
+    drop = FALSE
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.04))) +
+  labs(x = "Marker", y = "Number of OTUs", fill = NULL) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 20, face = "bold")
+  )
+
+p_b
+
+
+# ==========================================================
+# 9. PREPARE RETAINED OTUS FOR PANELS C AND D
+# ==========================================================
+otu_12S_retained <- filter_retained_otus(otu_12S_raw)
+otu_16S_retained <- filter_retained_otus(otu_16S_raw)
+
+
+# ==========================================================
+# 10. PANEL C: PERCENT IDENTITY DISTRIBUTIONS
+# ==========================================================
+percent_identity_df <- bind_rows(
+  otu_12S_retained %>%
+    transmute(Marker = "12S", Perc_ID = as.numeric(Perc_ID)),
+  otu_16S_retained %>%
+    transmute(Marker = "16S", Perc_ID = as.numeric(Perc_ID))
+) %>%
+  filter(!is.na(Perc_ID)) %>%
+  mutate(Marker = factor(Marker, levels = c("12S", "16S")))
+
+p_c <- ggplot(
+  percent_identity_df,
+  aes(x = Marker, y = Perc_ID, fill = Marker)
+) +
+  geom_half_violin(
+    side = "r",
+    trim = FALSE,
+    colour = NA,
+    width = 1,
+    nudge = 0.22
+  ) +
+  geom_boxplot(
+    width = 0.20,
+    outlier.shape = NA,
+    fill = "white",
+    colour = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(colour = Marker),
+    position = position_jitter(width = 0.18, height = 0),
+    alpha = 0.35,
+    size = 2.8
+  ) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    limits = c(95, 100),
+    breaks = seq(95, 100, 1),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  scale_colour_manual(values = marker_colours) +
+  labs(x = "Marker", y = "Percent identity (%)") +
+  publication_theme +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 20, face = "bold")
+  )
+
+p_c
+
+
+# ==========================================================
+# 11. PANEL D: TAXONOMIC RICHNESS
+# ==========================================================
+otu_12S_clean <- clean_taxonomy(otu_12S_retained) %>%
+  mutate(Marker = "12S")
+
+otu_16S_clean <- clean_taxonomy(otu_16S_retained) %>%
+  mutate(Marker = "16S")
+
+otu_12S_collapse <- collapse_by_taxon(otu_12S_clean)
+otu_16S_collapse <- collapse_by_taxon(otu_16S_clean)
+
+otu_combined <- bind_rows(otu_12S_collapse, otu_16S_collapse) %>%
+  group_by(Taxon) %>%
+  summarise(
+    Class = first(na.omit(Class)),
+    Order = first(na.omit(Order)),
+    Family = first(na.omit(Family)),
+    Genus = first(na.omit(Genus)),
+    Species = first(na.omit(Species)),
+    .groups = "drop"
+  )
+
+summarise_taxonomic_ranks <- function(df, marker_name) {
+  tibble(
+    Marker = marker_name,
+    Taxon = n_distinct(df$Taxon, na.rm = TRUE),
+    Species = n_distinct(df$Species, na.rm = TRUE),
+    Genus = n_distinct(df$Genus, na.rm = TRUE),
+    Family = n_distinct(df$Family, na.rm = TRUE),
+    Order = n_distinct(df$Order, na.rm = TRUE),
+    Class = n_distinct(df$Class, na.rm = TRUE)
+  )
+}
+
+marker_summary <- bind_rows(
+  summarise_taxonomic_ranks(otu_12S_collapse, "12S"),
+  summarise_taxonomic_ranks(otu_16S_collapse, "16S"),
+  summarise_taxonomic_ranks(otu_combined, "Combined")
+)
+
+marker_long <- marker_summary %>%
+  pivot_longer(
+    cols = c(Taxon, Species, Genus, Family, Order, Class),
+    names_to = "Rank",
+    values_to = "Count"
+  ) %>%
+  mutate(
+    Rank = factor(
+      Rank,
+      levels = c("Taxon", "Species", "Genus", "Family", "Order", "Class")
+    ),
+    Marker = factor(Marker, levels = c("12S", "16S", "Combined"))
+  )
+
+p_d <- ggplot(
+  marker_long,
+  aes(x = Rank, y = Count, fill = Marker)
+) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65,
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(label = Count),
+    position = position_dodge(width = 0.75),
+    vjust = -0.35,
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Taxonomic rank", y = "Number of taxa", fill = NULL) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 19, face = "bold")
+  )
+
+p_d
+
+
+# ==========================================================
+# 12. COMBINE FOUR PANELS
+# ==========================================================
+combined_plot <- (p_a | p_b) / (p_c | p_d) +
+  plot_layout(
+    widths = c(1.08, 1),
+    heights = c(1, 1)
+  ) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 30, face = "bold", colour = "black")
+    )
+  )
+
+combined_plot
+
+
+# ==========================================================
+# 13. SAVE PANELS AND COMBINED FIGURE
+# ==========================================================
+ggsave(
+  "figures2/Panel_A_Read_Proportions.png",
+  p_a,
+  width = 10,
+  height = 8,
+  dpi = 600
+)
+
+ggsave(
+  "figures2/Panel_B_OTU_Filtering_Stacked_Bar.png",
+  p_b,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  "figures2/Panel_C_Percent_Identity.png",
+  p_c,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  "figures2/Panel_D_Taxonomic_Richness.png",
+  p_d,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  "figures2/Figure2_4Panels_Combined.png",
+  combined_plot,
+  width = 20,
+  height = 14,
+  dpi = 300
+)
