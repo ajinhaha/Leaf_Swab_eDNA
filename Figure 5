@@ -1,1 +1,495 @@
+# ================================================================
+# LEAF-SWAB eDNA | PCoA OF VERTEBRATE COMMUNITY COMPOSITION
+# ================================================================
+# PURPOSE
+#   A. Compare sampling heights using individual leaf-swab samples.
+#   B. Compare locations after combining the three heights per plot.
+#
+# DATA AND TRANSFORMATION
+#   OTU read counts -> curated taxa -> presence/absence (0/1).
+#   Sørensen dissimilarity is calculated directly from binary data
+#   using vegan::vegdist(comm, method = "bray", binary = TRUE).
+#
+# STATISTICAL DESIGN
+#   Height: permutations constrained within plot (repeated samples).
+#   Location: one pooled presence/absence observation per plot.
+#   PERMANOVA and dispersion test are distinct: check both results.
+#   Envfit vectors are descriptive correlations, not causal effects.
+#
+# INPUT FILES (in working directory)
+#   Combined_12S_read_table.xlsx
+#   Combined_16S_read_table.xlsx
+#   Sample names expected: LOCATION_HEIGHT_PLOT (e.g. SWN_Lower_01).
+#
+# OUTPUT DIRECTORY: figures5
+#   Individual and combined plots in PNG and PDF formats.
+#   PERMANOVA, dispersion and envfit summaries in CSV format.
+# ================================================================
+
+# 1. PACKAGES -----------------------------------------------------
+# List the packages required for data cleaning, statistical analysis and plotting.
+required_packages <- c('dplyr', 'tidyr', 'readxl', 'ggplot2',
+                       'vegan', 'permute', 'patchwork', 'ggrepel')
+# Identify packages that must be installed before running the script.
+missing_packages <- setdiff(required_packages,
+                            rownames(installed.packages()))
+if (length(missing_packages)) {
+  stop('Install required packages first: install.packages(c(',
+       paste(sprintf('"%s"', missing_packages), collapse = ', '), '))')
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# 2. PATHS AND REPRODUCIBILITY -----------------------------------
+# Set the folder containing the two input Excel workbooks.
+setwd('C:/Users/Fajrin/Desktop/Analysis_manuscript')
+# Name the output folder used for all figures and statistical tables.
+output_dir <- 'figures5'
+# Create the output directory if it does not already exist.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+# Set a random seed so permutation results and label placement are reproducible.
+set.seed(2026)
+# Use 999 random permutations for hypothesis tests and taxon vectors.
+n_permutations <- 999
+
+# 3. DISTINCT COLOUR FAMILIES -------------------------------------
+# Marker (Figure 2): blue / orange / violet; defined here for reference.
+# Height (Figure 5A): raspberry pink / amber / turquoise.
+# Location (Figure 5B): cyan / crimson / olive / brown / periwinkle.
+# Colour meanings are consistent within each variable across figures.
+# Keep marker colours separate from height and location colours.
+marker_colors <- c(`12S` = '#4878A8', `16S` = '#C47A43',
+                   Combined = '#8064A2', Unassigned = '#A9ADB2')
+# Assign distinct colours to lower, middle and upper vegetation.
+height_colors <- c(
+  "Lower"  = "#C94D83",
+  "Middle" = "#D69A20",
+  "Upper"  = "#168F7A"
+)
+
+# Assign one stable colour to each sampling location.
+location_colors <- c(
+  "BBI" = "#159DA6",
+  "KRB" = "#C64A58",
+  "SBJ" = "#77983C",
+  "SLP" = "#9B7064",
+  "SWN" = "#748FB9"
+)
+
+# 4. PUBLICATION THEME -------------------------------------------
+# Increase all font sizes consistently across individual and combined plots.
+# Define a consistent large-font theme for journal figures.
+publication_theme <- theme_classic(base_size = 19) +
+  theme(
+    axis.title = element_text(size = 21, face = 'bold', colour = 'black'),
+    axis.text = element_text(size = 18, colour = 'black'),
+    legend.title = element_text(size = 19, face = 'bold'),
+    legend.text = element_text(size = 17),
+    legend.key.size = grid::unit(0.85, 'cm'),
+    plot.title = element_text(size = 21, face = 'bold'),
+    plot.tag = element_text(size = 27, face = 'bold'),
+    plot.margin = margin(18, 28, 18, 18),
+    axis.line = element_line(linewidth = 0.65),
+    axis.ticks = element_line(linewidth = 0.6)
+  )
+
+# 5. READ AND CURATE THE TWO MARKER TABLES ------------------------
+# Keep the original Note filtering vocabulary for compatibility.
+# 'Below_Genus' is an internal note meaning insufficient resolution;
+# in manuscript prose this corresponds to assignment ABOVE genus.
+# Identify OTU notes that indicate exclusion during taxonomic curation.
+excluded_pattern <- paste(c('Control', 'No_Borneo_Record', 'No_Taxa',
+                            'Below_Genus', 'Above_Genus', 'NUMTs',
+                            'Human', 'Domestic_Animal'), collapse = '|')
+# Define annotation fields so they are not mistaken for sample read counts.
+metadata_cols <- c('Taxon', 'Class', 'Order', 'Family', 'Genus',
+                   'Species', 'IUCN', 'Marker', 'Note', 'ID',
+                   'Seq', 'Perc_ID', 'English_Name')
+
+# Clean a marker table and return taxon names with numeric sample counts.
+prepare_marker <- function(path, marker) {
+  df <- as.data.frame(readxl::read_excel(path), check.names = FALSE)
+  names(df) <- trimws(names(df))
+  required <- c('Genus', 'Species', 'Note')
+  if (!all(required %in% names(df))) {
+    stop('Missing columns in ', path, ': ',
+         paste(setdiff(required, names(df)), collapse = ', '))
+  }
+  notes <- as.character(df$Note)
+  exclude <- grepl(excluded_pattern, notes, ignore.case = TRUE)
+  exclude[is.na(exclude)] <- FALSE
+  df <- df[!exclude, , drop = FALSE]
+  genus <- trimws(as.character(df$Genus))
+  species <- trimws(as.character(df$Species))
+  genus[genus %in% c('', 'NA', 'N/A')] <- NA_character_
+  species[species %in% c('', 'NA', 'N/A')] <- NA_character_
+  df$Taxon <- ifelse(!is.na(species), species,
+                     ifelse(!is.na(genus), paste0(genus, '_sp.'), NA_character_))
+  df <- df[!is.na(df$Taxon), , drop = FALSE]
+  df$Marker <- marker
+  sample_cols <- setdiff(names(df), metadata_cols)
+  # Remove any controls, including newly added PCR control columns.
+  sample_cols <- sample_cols[!grepl('^Control_', sample_cols,
+                                   ignore.case = TRUE)]
+  if (!length(sample_cols)) stop('No sample columns found in ', path)
+  for (nm in sample_cols) {
+    val <- suppressWarnings(as.numeric(as.character(df[[nm]])))
+    if (any(is.na(val) & !is.na(df[[nm]]) &
+            trimws(as.character(df[[nm]])) != '')) {
+      stop('Non-numeric read counts in ', path, ': ', nm)
+    }
+    df[[nm]] <- tidyr::replace_na(val, 0)
+    if (any(df[[nm]] < 0)) stop('Negative read count in ', nm)
+  }
+  df[, c('Taxon', sample_cols), drop = FALSE]
+}
+
+# Prepare the curated 12S read table.
+a <- prepare_marker('Combined_12S_read_table.xlsx', '12S')
+# Prepare the curated 16S read table.
+b <- prepare_marker('Combined_16S_read_table.xlsx', '16S')
+
+# 6. BUILD TAXON-BY-SAMPLE INCIDENCE MATRIX -----------------------
+# Long format avoids incorrect column matching when marker tables
+# contain different sample columns or a different column order.
+# Convert each marker table to taxon–sample–read long format.
+to_long <- function(df) {
+  tidyr::pivot_longer(df, cols = -Taxon,
+                      names_to = 'sample', values_to = 'reads')
+}
+# Merge markers and score a taxon as present if either marker detects it.
+combined_long <- dplyr::bind_rows(to_long(a), to_long(b)) %>%
+  dplyr::group_by(Taxon, sample) %>%
+  dplyr::summarise(present = as.integer(any(reads > 0)), .groups = 'drop')
+# Spread the binary detections into a taxon-by-sample table.
+incidence_wide <- combined_long %>%
+  tidyr::pivot_wider(names_from = sample, values_from = present,
+                     values_fill = 0)
+# Convert the table to a matrix for community analysis.
+incid <- as.matrix(incidence_wide[, -1, drop = FALSE])
+# Preserve taxon names as matrix row labels.
+rownames(incid) <- incidence_wide$Taxon
+# Ensure the incidence matrix is numeric.
+storage.mode(incid) <- 'numeric'
+
+# 7. PARSE SAMPLE METADATA AND REMOVE EMPTY SAMPLES --------------
+# Parse from right to allow plot IDs containing underscores.
+# Extract sample IDs from the incidence matrix.
+samples <- colnames(incid)
+# Define the expected LOCATION_HEIGHT_PLOT sample-name structure.
+pattern <- '^(.+)_(Lower|Middle|Upper)_(.+)$'
+if (any(!grepl(pattern, samples))) {
+  stop('Sample names do not match LOCATION_HEIGHT_PLOT: ',
+       paste(samples[!grepl(pattern, samples)], collapse = ', '))
+}
+# Extract location, height and plot identifiers for each sample.
+info <- data.frame(
+  sample = samples,
+  location = sub(pattern, '\\1', samples),
+  height = sub(pattern, '\\2', samples),
+  plot = sub(pattern, '\\3', samples),
+  stringsAsFactors = FALSE
+)
+# Create unique plot identifiers for restricted permutations.
+info$PlotID <- paste(info$location, info$plot, sep = '_')
+# Order height levels consistently across analyses and legends.
+info$height <- factor(info$height, levels = names(height_colors))
+# Order location levels consistently across analyses and legends.
+info$location <- factor(info$location, levels = names(location_colors))
+if (anyNA(info$height) || anyNA(info$location)) {
+  stop('Unexpected height or location labels in sample names.')
+}
+# Identify samples with at least one detected taxon.
+keep <- colSums(incid) > 0
+if (any(!keep)) message('Excluding ', sum(!keep), ' zero-detection swabs.')
+# Remove samples with no taxa before calculating dissimilarities.
+incid <- incid[, keep, drop = FALSE]
+info <- info[match(colnames(incid), info$sample), , drop = FALSE]
+if (ncol(incid) < 3) stop('Too few nonempty samples for PCoA.')
+
+# 8. HELPER: ORDINATION AND EXPLAINED VARIATION -------------------
+# Sørensen dissimilarity on binary sample-by-taxon data.
+# Lingoes additive correction makes PCoA eigenvalues nonnegative.
+# Compute Sørensen dissimilarities and the corrected two-axis PCoA.
+make_ordination <- function(comm) {
+  d <- vegan::vegdist(comm, method = 'bray', binary = TRUE)
+  ord <- stats::cmdscale(d, k = 2, eig = TRUE, add = TRUE)
+  if (is.null(dim(ord$points)) || ncol(ord$points) < 2) {
+    stop('Ordination has fewer than two axes.')
+  }
+  pos <- ord$eig[ord$eig > 1e-10]
+  explained <- 100 * ord$eig[1:2] / sum(pos)
+  scores <- as.data.frame(ord$points)
+  names(scores) <- c('PCoA1', 'PCoA2')
+  scores$sample <- rownames(scores)
+  list(distance = d, ord = ord,
+       scores = scores, explained = explained)
+}
+
+# 9. HELPER: PERMANOVA AND DISPERSION -----------------------------
+# Height permutations must remain within PlotID. Location analysis
+# is performed on independent plot-level pooled observations.
+# Run PERMANOVA and a permutation test of multivariate dispersion.
+run_tests <- function(d, grouping, blocks = NULL) {
+  group <- droplevels(factor(grouping))
+  if (nlevels(group) < 2) stop('At least two groups required.')
+  if (is.null(blocks)) {
+    design <- permute::how(nperm = n_permutations)
+  } else {
+    design <- permute::how(nperm = n_permutations,
+                           blocks = factor(blocks))
+  }
+  ad <- vegan::adonis2(d ~ group, permutations = design)
+  bd <- vegan::betadisper(d, group)
+  bd_perm <- vegan::permutest(bd, permutations = design)
+  list(permanova = ad, dispersion = bd_perm,
+       permanova_p = ad$`Pr(>F)`[1],
+       dispersion_p = bd_perm$tab[1, 'Pr(>F)'])
+}
+
+# 10. HELPER: TAXON VECTORS --------------------------------------
+# Fit taxon presence vectors to the first two PCoA axes. The
+# displayed arrow length is scaled for legibility and is not a
+# direct measure of abundance. Colours follow aligned centroids.
+# Fit and select significant animal-taxon vectors for optional display.
+get_vectors <- function(ord, comm, scores_df, group_var,
+                        palette, top_n = 8) {
+  fit <- vegan::envfit(ord$points, comm,
+                       permutations = n_permutations, na.rm = TRUE)
+  if (is.null(fit$vectors) || !length(fit$vectors$pvals)) {
+    return(data.frame())
+  }
+  vec <- as.data.frame(vegan::scores(fit, display = 'vectors'))
+  if (ncol(vec) < 2) return(data.frame())
+  names(vec)[1:2] <- c('Dim1', 'Dim2')
+  vec$Taxon <- rownames(vec)
+  vec$pval <- fit$vectors$pvals
+  vec$r2 <- fit$vectors$r
+  vec <- vec[!is.na(vec$pval) & vec$pval <= 0.05, , drop = FALSE]
+  vec <- vec[order(vec$pval, -vec$r2), , drop = FALSE]
+  vec <- head(vec, top_n)
+  if (!nrow(vec)) return(vec)
+  centroids <- scores_df %>%
+    dplyr::group_by(group = .data[[group_var]]) %>%
+    dplyr::summarise(Centroid1 = mean(PCoA1),
+                     Centroid2 = mean(PCoA2), .groups = 'drop')
+  best <- vapply(seq_len(nrow(vec)), function(i) {
+    v <- as.numeric(vec[i, c('Dim1', 'Dim2')])
+    similarities <- vapply(seq_len(nrow(centroids)), function(j) {
+      c <- as.numeric(centroids[j, c('Centroid1', 'Centroid2')])
+      if (sum(v^2) == 0 || sum(c^2) == 0) return(-Inf)
+      sum(v * c) / sqrt(sum(v^2) * sum(c^2))
+    }, numeric(1))
+    if (all(!is.finite(similarities))) return(NA_character_)
+    as.character(centroids$group[which.max(similarities)])
+  }, character(1))
+  vec$assigned_group <- best
+  # Scale vector directions by the square root of their correlation strength.
+  vec$Dim1 <- vec$Dim1 * sqrt(vec$r2)
+  vec$Dim2 <- vec$Dim2 * sqrt(vec$r2)
+  span <- min(diff(range(scores_df$PCoA1)),
+              diff(range(scores_df$PCoA2)))
+  max_length <- max(sqrt(vec$Dim1^2 + vec$Dim2^2))
+  if (is.finite(max_length) && max_length > 0 && span > 0) {
+    scale_factor <- 0.32 * span / max_length
+    vec$Dim1 <- vec$Dim1 * scale_factor
+    vec$Dim2 <- vec$Dim2 * scale_factor
+  }
+  vec
+}
+
+# 11. HELPER: DRAW PCOA WITH LARGER TEXT --------------------------
+# Draw points, confidence ellipses, test labels and optional taxon arrows.
+make_plot <- function(scores_df, vectors, group_var, palette,
+                      explained, stats, legend_title) {
+  p_text <- paste0('PERMANOVA p = ',
+                   format.pval(stats$permanova_p, digits = 2, eps = 0.001),
+                   '\nDispersion p = ',
+                   format.pval(stats$dispersion_p, digits = 2, eps = 0.001))
+  p <- ggplot(scores_df, aes(PCoA1, PCoA2)) +
+    stat_ellipse(aes(colour = .data[[group_var]],
+                     group = .data[[group_var]]),
+                 level = 0.95, linewidth = 0.85, alpha = 0.9,
+                 show.legend = FALSE, na.rm = TRUE) +
+    geom_point(aes(colour = .data[[group_var]]),
+               size = 3.2, alpha = 0.75) +
+    scale_colour_manual(values = palette, drop = FALSE) +
+    labs(x = sprintf('PCoA1 (%.1f%%)', explained[1]),
+         y = sprintf('PCoA2 (%.1f%%)', explained[2]),
+         colour = legend_title) +
+    annotate('label', x = -Inf, y = Inf, label = p_text,
+             hjust = -0.04, vjust = 1.1, size = 4.8,
+             label.size = 0.25, fill = 'white') +
+    publication_theme +
+    theme(legend.position = 'right')
+  if (nrow(vectors) > 0) {
+    p <- p +
+      geom_segment(data = vectors,
+                   aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+                   inherit.aes = FALSE,
+                   arrow = grid::arrow(length = grid::unit(0.23, 'cm')),
+                   linewidth = 0.7, colour = '#52565A',
+                   alpha = 0.85, show.legend = FALSE) +
+      ggrepel::geom_text_repel(
+        data = vectors,
+        aes(x = Dim1, y = Dim2, label = gsub('_', ' ', Taxon)),
+        inherit.aes = FALSE, size = 4.3,
+        colour = '#404449', fontface = 'italic',
+        max.overlaps = Inf, box.padding = 0.35,
+        show.legend = FALSE, seed = 2026)
+  }
+  p
+}
+
+# 12. PANEL A: HEIGHT (INDIVIDUAL SWABS) --------------------------
+# Transpose the incidence matrix to samples-by-taxa for Panel A.
+comm_height <- t(incid)
+# Calculate the height-level Sørensen PCoA.
+ord_height <- make_ordination(comm_height)
+# Attach height and plot metadata to ordination coordinates.
+scores_height <- dplyr::left_join(ord_height$scores, info, by = 'sample')
+# Test height effects while restricting permutations within plots.
+stats_height <- run_tests(ord_height$distance, info$height,
+                          blocks = info$PlotID)
+# Identify taxa associated with the height-level ordination.
+vectors_height <- get_vectors(ord_height$ord, comm_height,
+                              scores_height, 'height', height_colors)
+# Create the clean height panel without taxon vectors.
+p_height <- make_plot(scores_height, vectors_height[0, , drop = FALSE], 'height',
+                      height_colors, ord_height$explained,
+                      stats_height, 'Vegetation height')
+# Create the height panel with significant taxon vectors.
+p_height_vectors <- make_plot(scores_height, vectors_height, 'height',
+                              height_colors, ord_height$explained,
+                              stats_height, 'Vegetation height')
+
+# 13. PANEL B: LOCATION (HEIGHTS POOLED BY PLOT) ------------------
+# Pool presence/absence within each location-plot combination.
+# This preserves plots as the independent sampling units.
+# Pool all vegetation heights within each plot by summing binary detections.
+pooled <- rowsum(t(incid), group = info$PlotID, reorder = TRUE)
+# Convert pooled counts back to presence–absence (0 or 1).
+pooled[pooled > 0] <- 1
+# Create one metadata record for each pooled plot.
+info_plot <- info %>%
+  dplyr::distinct(PlotID, location) %>%
+  dplyr::mutate(sample = PlotID)
+info_plot <- info_plot[match(rownames(pooled), info_plot$sample), , drop = FALSE]
+stopifnot(!anyNA(info_plot$location))
+# Calculate the plot-level Sørensen PCoA for location comparisons.
+ord_location <- make_ordination(pooled)
+# Attach location metadata to plot-level ordination coordinates.
+scores_location <- dplyr::left_join(ord_location$scores,
+                                    info_plot, by = 'sample')
+# Test location differences using independent pooled plots.
+stats_location <- run_tests(ord_location$distance, info_plot$location)
+# Identify taxa associated with the location-level ordination.
+vectors_location <- get_vectors(ord_location$ord, pooled,
+                                scores_location, 'location', location_colors)
+# Create the clean location panel without taxon vectors.
+p_location <- make_plot(scores_location, vectors_location[0, , drop = FALSE], 'location',
+                        location_colors, ord_location$explained,
+                        stats_location, 'Location')
+# Create the location panel with significant taxon vectors.
+p_location_vectors <- make_plot(scores_location, vectors_location, 'location',
+                                location_colors, ord_location$explained,
+                                stats_location, 'Location')
+
+# 14. LEGEND FORMATTING ------------------------------------------
+# Each panel receives its own centred legend beneath the axes.
+# This must be applied BEFORE the panels are combined and exported.
+format_bottom_legend <- function(plot, title) {
+  plot +
+    theme(
+      legend.position = 'bottom',
+      legend.justification = 'center',
+      legend.direction = 'horizontal',
+      legend.title = element_text(size = 17, face = 'bold'),
+      legend.text = element_text(size = 16),
+      legend.spacing.x = grid::unit(0.15, 'cm'),
+      legend.box.margin = margin(t = 5)
+    ) +
+    guides(colour = guide_legend(title = title, nrow = 1,
+                                 title.position = 'left'))
+}
+
+# Apply identical legend styling to clean and taxon-vector versions.
+p_height <- format_bottom_legend(p_height, 'Vegetation height')
+# Create the height panel with significant taxon vectors.
+p_height_vectors <- format_bottom_legend(p_height_vectors, 'Vegetation height')
+p_location <- format_bottom_legend(p_location, 'Location')
+# Create the location panel with significant taxon vectors.
+p_location_vectors <- format_bottom_legend(p_location_vectors, 'Location')
+
+# 15. COMBINE PANELS ----------------------------------------------
+# guides = 'keep' ensures each panel retains its independent legend.
+# Side-by-side layout is the primary journal figure.
+combined_fig <- (p_height_vectors | p_location_vectors) +
+  patchwork::plot_layout(widths = c(1, 1), guides = 'keep') +
+  patchwork::plot_annotation(tag_levels = 'A',
+    theme = theme(plot.tag = element_text(size = 28, face = 'bold')))
+
+# Vertical layout is an alternative when journal column width is limited.
+combined_fig_vertical <- (p_height_vectors / p_location_vectors) +
+  patchwork::plot_layout(guides = 'keep') +
+  patchwork::plot_annotation(tag_levels = 'A',
+    theme = theme(plot.tag = element_text(size = 28, face = 'bold')))
+
+# Clean layout omits taxon vectors to show community overlap clearly.
+combined_clean <- (p_height | p_location) +
+  patchwork::plot_layout(widths = c(1, 1), guides = 'keep') +
+  patchwork::plot_annotation(tag_levels = 'A',
+    theme = theme(plot.tag = element_text(size = 28, face = 'bold')))
+
+# Display the primary figure in the RStudio plotting window.
+print(combined_fig)
+
+# 16. EXPORT FIGURES ----------------------------------------------
+# Save PNG at 600 dpi and vector PDF for journal submission.
+save_figure <- function(plot, filename, width, height) {
+  ggsave(file.path(output_dir, paste0(filename, '.png')),
+         plot = plot, width = width, height = height, dpi = 600,
+         bg = 'white', limitsize = FALSE)
+  ggsave(file.path(output_dir, paste0(filename, '.pdf')),
+         plot = plot, width = width, height = height,
+         bg = 'white', limitsize = FALSE)
+}
+
+# Save clean individual panels and taxon-vector versions.
+save_figure(p_height, 'PCoA_A_Vegetation_Height', 11, 8)
+save_figure(p_location, 'PCoA_B_Location_Pooled_By_Plot', 11, 8)
+save_figure(p_height_vectors, 'Supplement_PCoA_Height_Vectors', 11, 8)
+save_figure(p_location_vectors, 'Supplement_PCoA_Location_Vectors', 11, 8)
+
+# Save the primary side-by-side, vertical, and clean combinations.
+save_figure(combined_fig, 'PCoA_Combined_AB_Side_by_Side_With_Taxa', 22, 9)
+save_figure(combined_fig_vertical, 'PCoA_Combined_AB_Vertical_With_Taxa', 12, 17)
+save_figure(combined_clean, 'PCoA_Combined_AB_Side_by_Side_Clean', 22, 9)
+
+# 17. EXPORT STATISTICAL RESULTS ---------------------------------
+# Store raw p-values, PERMANOVA effect sizes, and sample sizes.
+summary_tests <- data.frame(
+  Comparison = c('Vegetation height (within-plot permutations)',
+                 'Location (pooled by plot)'),
+  N = c(nrow(comm_height), nrow(pooled)),
+  PERMANOVA_F = c(stats_height$permanova$F[1],
+                  stats_location$permanova$F[1]),
+  PERMANOVA_R2 = c(stats_height$permanova$R2[1],
+                   stats_location$permanova$R2[1]),
+  PERMANOVA_p = c(stats_height$permanova_p,
+                  stats_location$permanova_p),
+  Dispersion_p = c(stats_height$dispersion_p,
+                   stats_location$dispersion_p)
+)
+
+# Export the test summary and significant taxon vectors to CSV files.
+write.csv(summary_tests, file.path(output_dir, 'PCoA_Statistical_Summary.csv'),
+          row.names = FALSE)
+write.csv(vectors_height, file.path(output_dir, 'Envfit_Height_Vectors.csv'),
+          row.names = FALSE)
+write.csv(vectors_location, file.path(output_dir, 'Envfit_Location_Vectors.csv'),
+          row.names = FALSE)
+
+# Report the final output directory in the R console.
+message('Done. Figures and statistical tables saved to: ',
+        normalizePath(output_dir))
 
