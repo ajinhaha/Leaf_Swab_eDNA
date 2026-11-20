@@ -1,0 +1,627 @@
+# =============================================================================
+# LEAF-SWAB eDNA: TAXON RICHNESS ACCUMULATION BY TRAIT AND SAMPLING HEIGHT
+# COMPLETE SCRIPT — RUN FROM THE FIRST LINE IN A NEW R SESSION
+# =============================================================================
+# Analysis: incidence-based Hill number q=0 (taxon richness), iNEXT.
+# Rows: A Diet; B Body size; C Locomotion.
+# Columns: Lower (<1 m); Middle (1.3–1.5 m); Upper (2–2.5 m).
+# IMPORTANT: Upper is only relabelled; original sample names are unchanged.
+# Outputs: combined 3x3 PNG (600 dpi), vector PDF, curves and CI diagnostics.
+# Missing CIs are reported, NEVER copied from other heights or fabricated.
+# =============================================================================
+
+# 01. INSTALL PACKAGES ONCE (uncomment if needed) ------------------------------
+# install.packages(c("readxl", "dplyr", "stringr", "ggplot2", "iNEXT", "patchwork"))
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(iNEXT)
+  library(patchwork)
+})
+
+# 02. USER SETTINGS -----------------------------------------------------------
+# Change this path only if your analysis folder is elsewhere.
+setwd("C:/Users/Fajrin/Desktop/Analysis_manuscript/")
+output_dir <- "figures/iNEXT_ecological_traits/by_height"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+seed <- 123L
+nboot <- 200L
+retry_nboot <- 400L
+conf_level <- 0.95
+knots <- 100L
+height_levels <- c("Lower", "Middle", "Upper")
+height_labels <- c("Lower (<1 m)", "Middle (1.3–1.5 m)", "Upper (2–2.5 m)")
+trait_names <- c("Diet", "Body_size", "Locomotion")
+
+# 03. READ ALL THREE ORIGINAL EXCEL FILES ------------------------------------
+input_files <- c("Combined_12S_read_table.xlsx",
+                 "Combined_16S_read_table.xlsx",
+                 "Leaf_swab_taxa_ecological_traits.xlsx")
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files)) stop("Missing Excel files: ", paste(missing_files, collapse = ", "))
+otu_12S <- read_excel(input_files[1])
+otu_16S <- read_excel(input_files[2])
+traits_raw <- read_excel(input_files[3])
+names(otu_12S) <- trimws(names(otu_12S))
+names(otu_16S) <- trimws(names(otu_16S))
+names(traits_raw) <- trimws(names(traits_raw))
+
+# 04. IDENTIFY THE 288 BIOLOGICAL SAMPLES ------------------------------------
+# Control samples are not selected. Keep samples with zero detections.
+sample_pattern <- "^(SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_.+$"
+sample_columns <- sort(union(
+  grep(sample_pattern, names(otu_12S), value = TRUE),
+  grep(sample_pattern, names(otu_16S), value = TRUE)
+))
+if (!length(sample_columns)) stop("No biological sample columns found.")
+sample_height <- setNames(
+  str_match(sample_columns, "^(?:SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_")[, 2],
+  sample_columns
+)
+print(table(factor(sample_height, levels = height_levels)))
+if (length(sample_columns) != 288L) warning("Expected 288 biological samples; found ", length(sample_columns))
+
+# 05. CLEAN TAXON NAMES AND COMBINE 12S + 16S -------------------------------
+normalize_taxon <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "NaN", "NULL")] <- NA_character_
+  x
+}
+exclude_notes <- "Control|No_Borneo_Record|No_Taxa|Below_Genus|NUMTs|Human|Domestic_Animal"
+prepare_marker <- function(df, marker) {
+  required <- c("Genus", "Species", "Note")
+  if (!all(required %in% names(df)))
+    stop(marker, " missing columns: ", paste(setdiff(required, names(df)), collapse = ", "))
+  for (s in setdiff(sample_columns, names(df))) df[[s]] <- 0
+  df <- df %>%
+    filter(!str_detect(coalesce(as.character(Note), ""), regex(exclude_notes, ignore_case = TRUE))) %>%
+    mutate(
+      Genus = normalize_taxon(Genus),
+      Species = normalize_taxon(Species),
+      Taxon = if_else(!is.na(Species), Species,
+                      if_else(!is.na(Genus), paste0(Genus, "_sp."), NA_character_))
+    ) %>%
+    filter(!is.na(Taxon))
+  df[sample_columns] <- lapply(df[sample_columns], function(v) {
+    z <- suppressWarnings(as.numeric(as.character(v)))
+    z[is.na(z)] <- 0
+    if (any(!is.finite(z) | z < 0)) stop("Invalid read counts in ", marker)
+    z
+  })
+  df %>% group_by(Taxon) %>%
+    summarise(across(all_of(sample_columns), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+}
+combined_reads <- bind_rows(
+  prepare_marker(otu_12S, "12S"),
+  prepare_marker(otu_16S, "16S")
+) %>% group_by(Taxon) %>%
+  summarise(across(all_of(sample_columns), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+# 06. JOIN TAXONOMIC ECOLOGICAL TRAITS ---------------------------------------
+find_col <- function(df, candidates) {
+  found <- intersect(candidates, names(df))
+  if (!length(found)) stop("Trait column not found. Expected: ", paste(candidates, collapse = " / "))
+  found[1]
+}
+trait_data <- data.frame(
+  Taxon = normalize_taxon(traits_raw[[find_col(traits_raw, "Taxon")]]),
+  Diet = normalize_taxon(traits_raw[[find_col(traits_raw, "Diet")]]),
+  Body_size = normalize_taxon(traits_raw[[find_col(traits_raw,
+    c("Body-size class", "Body_size", "Body size class"))]]),
+  Locomotion = normalize_taxon(traits_raw[[find_col(traits_raw, "Locomotion")]]),
+  stringsAsFactors = FALSE
+) %>% filter(!is.na(Taxon))
+if (anyDuplicated(trait_data$Taxon)) stop("Duplicate Taxon names in trait table.")
+# Correct the two previously identified bat locomotion classifications.
+trait_data$Locomotion[trait_data$Taxon %in%
+  c("Balionycteris_maculata", "Mops_plicatus")] <- "Chiropteran volant"
+unmatched <- anti_join(combined_reads, trait_data, by = "Taxon")
+write.csv(unmatched %>% select(Taxon), file.path(output_dir, "unmatched_taxa.csv"), row.names = FALSE)
+matched <- inner_join(combined_reads, trait_data, by = "Taxon")
+if (!nrow(matched)) stop("No detected taxa matched the trait table.")
+message("Matched taxa: ", nrow(matched), "; unmatched: ", nrow(unmatched))
+incidence <- as.matrix(matched[, sample_columns, drop = FALSE])
+storage.mode(incidence) <- "numeric"
+incidence <- (incidence > 0) * 1L
+rownames(incidence) <- matched$Taxon
+
+# 07. FIXED CATEGORY COLOURS -------------------------------------------------
+trait_palettes <- list(
+  Diet = c(Omnivore = "#4477AA", Insectivore = "#228833",
+           Frugivore = "#CCBB44", Herbivore = "#EE6677",
+           Carnivore = "#AA3377", Other = "#66CCEE"),
+  Body_size = c(Small = "#4477AA", Medium = "#228833", Large = "#EE7733"),
+  Locomotion = c("Avian volant" = "#4477AA",
+                 "Chiropteran volant" = "#AA3377",
+                 Arboreal = "#228833", "Semi-arboreal" = "#CCBB44",
+                 Terrestrial = "#EE7733", Aquatic = "#66CCEE")
+)
+
+# 08. FIT iNEXT BY TRAIT, HEIGHT, AND CATEGORY -------------------------------
+# CRITICAL FIX: iNEXT incidence_raw takes a NAMED LIST of incidence matrices.
+# We extract fit$iNextEst$size_based DIRECTLY, rather than relying on fortify().
+# Each matrix retains all 96 height-specific samples, including empty samples.
+# If bootstrap CI fails, retry with 400 replicates; if still unavailable,
+# retain the valid richness curve and record missing uncertainty honestly.
+all_curves <- list()
+all_summary <- list()
+fit_log <- list()
+idx <- 0L
+
+for (trait_name in trait_names) {
+  categories <- sort(unique(na.omit(matched[[trait_name]])))
+  for (height in height_levels) {
+    hs <- names(sample_height)[sample_height == height]
+    for (category in categories) {
+      idx <- idx + 1L
+      taxa <- matched$Taxon[!is.na(matched[[trait_name]]) & matched[[trait_name]] == category]
+      mat <- incidence[taxa, hs, drop = FALSE]
+      n_detected <- sum(rowSums(mat) > 0)
+      all_summary[[idx]] <- data.frame(
+        Trait = trait_name, Height = height, Assemblage = category,
+        Samples = ncol(mat), Samples_with_detection = sum(colSums(mat) > 0),
+        Observed_taxa = n_detected
+      )
+      if (n_detected == 0L) {
+        fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+          Assemblage = category, Attempt = "Skipped", Status = "Zero detections",
+          Missing_CI = NA_integer_, Error = "")
+        next
+      }
+      # Use the exact incidence matrix for this category and sampling height.
+      # Keep taxa absent at this height; iNEXT may ignore zero-only rows.
+      # Remove zero-only taxa for numerical stability, but NOT sample columns.
+      mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+      run_fit <- function(boot, seed_offset = 0L) {
+        set.seed(seed + idx + seed_offset)
+        iNEXT::iNEXT(
+          x = setNames(list(mat), category),
+          q = 0, datatype = "incidence_raw", se = TRUE,
+          conf = conf_level, nboot = boot, knots = knots,
+          endpoint = 2 * ncol(mat)
+        )
+      }
+      err <- ""
+      fit <- tryCatch(run_fit(nboot), error = function(e) {
+        err <<- conditionMessage(e)
+        NULL
+      })
+      extract_curves <- function(obj) {
+        if (is.null(obj) || is.null(obj$iNextEst$size_based)) return(NULL)
+        z <- as.data.frame(obj$iNextEst$size_based)
+        required <- c("Assemblage", "t", "Method", "qD")
+        if (!all(required %in% names(z)))
+          stop("Unexpected iNEXT size_based columns: ", paste(names(z), collapse = ", "))
+        z <- z[is.na(z$Order.q) | z$Order.q == 0, , drop = FALSE]
+        z$CI_lower <- if ("qD.LCL" %in% names(z)) z$qD.LCL else NA_real_
+        z$CI_upper <- if ("qD.UCL" %in% names(z)) z$qD.UCL else NA_real_
+        z
+      }
+      result <- tryCatch(extract_curves(fit), error = function(e) {
+        err <<- paste(err, conditionMessage(e))
+        NULL
+      })
+      attempt <- "Initial (200 bootstraps)"
+      needs_retry <- is.null(result) ||
+        (nrow(result) > 0 && all(is.na(result$CI_lower) | is.na(result$CI_upper)))
+      if (needs_retry) {
+        err_retry <- ""
+        fit2 <- tryCatch(run_fit(retry_nboot, 100000L), error = function(e) {
+          err_retry <<- conditionMessage(e)
+          NULL
+        })
+        result2 <- tryCatch(extract_curves(fit2), error = function(e) {
+          err_retry <<- paste(err_retry, conditionMessage(e))
+          NULL
+        })
+        if (!is.null(result2) && nrow(result2)) result <- result2
+        err <- paste(err, err_retry)
+        attempt <- "Retry (400 bootstraps)"
+      }
+      # Last resort: compute point estimates with se=FALSE, without fake CIs.
+      if (is.null(result) || !nrow(result)) {
+        fit3 <- tryCatch(
+          iNEXT::iNEXT(setNames(list(mat), category), q = 0,
+            datatype = "incidence_raw", se = FALSE,
+            knots = knots, endpoint = 2 * ncol(mat)),
+          error = function(e) { err <<- paste(err, conditionMessage(e)); NULL }
+        )
+        result <- tryCatch(extract_curves(fit3), error = function(e) NULL)
+        attempt <- "Point estimates only (no CI)"
+      }
+      if (is.null(result) || !nrow(result)) {
+        fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+          Assemblage = category, Attempt = attempt, Status = "FAILED",
+          Missing_CI = NA_integer_, Error = trimws(err))
+        warning("FAILED: ", trait_name, " / ", height, " / ", category, ": ", err)
+        next
+      }
+      result$Trait <- trait_name
+      result$Height <- height
+      result$Assemblage <- category
+      result$Curve_type <- result$Method
+      all_curves[[length(all_curves) + 1L]] <- result
+      missing_ci <- sum(is.na(result$CI_lower) | is.na(result$CI_upper))
+      fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+        Assemblage = category, Attempt = attempt,
+        Status = if (missing_ci == 0) "CI complete" else "CI incomplete",
+        Missing_CI = missing_ci, Error = trimws(err))
+      message(sprintf("%-11s | %-6s | %-20s | %s | missing CI: %d",
+                      trait_name, height, category, attempt, missing_ci))
+    }
+  }
+}
+
+# 09. SAVE ANALYSIS RESULTS EVEN IF SOME FITS FAIL ---------------------------
+summary_df <- bind_rows(all_summary)
+log_df <- bind_rows(fit_log)
+write.csv(summary_df, file.path(output_dir, "trait_height_observed_richness.csv"), row.names = FALSE)
+write.csv(log_df, file.path(output_dir, "iNEXT_fit_diagnostics.csv"), row.names = FALSE)
+if (!length(all_curves)) {
+  stop("No curves produced. Open iNEXT_fit_diagnostics.csv to see the exact errors.")
+}
+curves_df <- bind_rows(all_curves)
+write.csv(curves_df, file.path(output_dir, "ALL_trait_height_richness_curves.csv"), row.names = FALSE)
+ci_diag <- curves_df %>%
+  group_by(Trait, Height, Assemblage, Method) %>%
+  summarise(N = n(), Missing_lower = sum(is.na(CI_lower)),
+            Missing_upper = sum(is.na(CI_upper)),
+            Mean_CI_width = if (all(is.na(CI_lower) | is.na(CI_upper))) NA_real_
+              else mean(CI_upper - CI_lower, na.rm = TRUE),
+            .groups = "drop")
+write.csv(ci_diag, file.path(output_dir, "confidence_interval_diagnostics.csv"), row.names = FALSE)
+print(ci_diag %>% filter(Trait == "Locomotion", Height == "Middle"), n = Inf)
+
+
+
+  # ================================================================
+  # 10. PLOT EACH TRAIT × HEIGHT PANEL
+  # ================================================================
+  # Larger text and thicker lines for publication-quality figures.
+  # Solid = rarefaction; dashed = extrapolation.
+  # Shaded ribbons = 95% confidence intervals.
+  # Points = observed sample size.
+  
+  make_panel <- function(trait_name, height, panel_tag = NULL) {
+    
+    dat <- curves_df %>%
+      filter(Trait == trait_name, Height == height)
+    
+    palette <- trait_palettes[[trait_name]]
+    
+    # Include any unexpected category labels.
+    extra <- setdiff(unique(dat$Assemblage), names(palette))
+    
+    if (length(extra)) {
+      warning(
+        "Unrecognised ", trait_name, " categories: ",
+        paste(extra, collapse = ", ")
+      )
+      
+      palette <- c(
+        palette,
+        setNames(
+          grDevices::hcl.colors(length(extra), "Dark 3"),
+          extra
+        )
+      )
+    }
+    
+    dat$Assemblage <- factor(
+      dat$Assemblage,
+      levels = names(palette)
+    )
+    
+    # Separate curve types.
+    lines <- dat %>%
+      filter(Method %in% c("Rarefaction", "Extrapolation"))
+    
+    ribbons <- lines %>%
+      filter(
+        is.finite(CI_lower),
+        is.finite(CI_upper)
+      )
+    
+    observed <- dat %>%
+      filter(Method == "Observed")
+    
+    # --------------------------------------------------------------
+    # BUILD PLOT
+    # --------------------------------------------------------------
+    
+    p <- ggplot() +
+      
+      # 95% confidence interval ribbons
+      geom_ribbon(
+        data = ribbons,
+        aes(
+          x = t,
+          ymin = CI_lower,
+          ymax = CI_upper,
+          fill = Assemblage,
+          group = interaction(Assemblage, Method)
+        ),
+        alpha = 0.14,
+        colour = NA,
+        show.legend = FALSE
+      ) +
+      
+      # Rarefaction and extrapolation curves
+      geom_line(
+        data = lines,
+        aes(
+          x = t,
+          y = qD,
+          colour = Assemblage,
+          linetype = Method,
+          group = interaction(Assemblage, Method)
+        ),
+        linewidth = 1.05,
+        na.rm = TRUE
+      ) +
+      
+      # Observed richness
+      geom_point(
+        data = observed,
+        aes(
+          x = t,
+          y = qD,
+          colour = Assemblage
+        ),
+        size = 2.5,
+        na.rm = TRUE,
+        show.legend = FALSE
+      ) +
+      
+      # Fixed colours across heights
+      scale_colour_manual(
+        values = palette,
+        drop = FALSE,
+        name = trait_name
+      ) +
+      
+      scale_fill_manual(
+        values = palette,
+        drop = FALSE
+      ) +
+      
+      # Curve types
+      scale_linetype_manual(
+        values = c(
+          Rarefaction = "solid",
+          Extrapolation = "dashed"
+        ),
+        breaks = c(
+          "Rarefaction",
+          "Extrapolation"
+        ),
+        name = "Curve"
+      ) +
+      
+      # Axis and panel titles
+      labs(
+        title = height_labels[
+          match(height, height_levels)
+        ],
+        x = "Number of leaf-swab samples",
+        y = "Taxon richness"
+      ) +
+      
+      # ------------------------------------------------------------
+    # FONT SIZE SETTINGS
+    # ------------------------------------------------------------
+    
+    theme_bw(base_size = 14) +
+      
+      theme(
+        # Panel background and grid
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(
+          colour = "grey92",
+          linewidth = 0.2
+        ),
+        
+        # Panel title: Lower, Middle, Upper
+        plot.title = element_text(
+          face = "bold",
+          hjust = 0.5,
+          size = 16,
+          margin = margin(b = 8)
+        ),
+        
+        # Axis titles
+        axis.title.x = element_text(
+          size = 14,
+          margin = margin(t = 8)
+        ),
+        
+        axis.title.y = element_text(
+          size = 14,
+          margin = margin(r = 8)
+        ),
+        
+        # Axis tick labels
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        
+        # Legend titles
+        legend.title = element_text(
+          face = "bold",
+          size = 14
+        ),
+        
+        # Legend category labels
+        legend.text = element_text(
+          size = 12
+        ),
+        
+        # Legend spacing
+        legend.key.width = grid::unit(1.2, "cm"),
+        legend.spacing.x = grid::unit(0.3, "cm"),
+        
+        # Panel spacing
+        plot.margin = margin(8, 8, 8, 8)
+      )
+    
+    # --------------------------------------------------------------
+    # ADD BOLD PANEL TAGS: A, B, C
+    # --------------------------------------------------------------
+    
+    if (!is.null(panel_tag)) {
+      
+      p <- p +
+        labs(tag = panel_tag) +
+        theme(
+          plot.tag = element_text(
+            face = "bold",
+            size = 22
+          )
+        )
+    }
+    
+    return(p)
+  }
+  
+  
+  # ================================================================
+  # 11. COMBINE 3 ROWS × 3 COLUMNS
+  # ================================================================
+  # Row A = Diet
+  # Row B = Body size
+  # Row C = Locomotion
+  #
+  # Each row has its own collected legend.
+  
+  library(patchwork)
+  
+  # ---------------------------------------------------------------
+  # ROW A: DIET
+  # ---------------------------------------------------------------
+  
+  row_diet <- (
+    make_panel("Diet", "Lower", "A") |
+      make_panel("Diet", "Middle") |
+      make_panel("Diet", "Upper")
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  
+  # ---------------------------------------------------------------
+  # ROW B: BODY SIZE
+  # ---------------------------------------------------------------
+  
+  row_body <- (
+    make_panel("Body_size", "Lower", "B") |
+      make_panel("Body_size", "Middle") |
+      make_panel("Body_size", "Upper")
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  
+  # ---------------------------------------------------------------
+  # ROW C: LOCOMOTION
+  # ---------------------------------------------------------------
+  
+  row_locomotion <- (
+    make_panel("Locomotion", "Lower", "C") |
+      make_panel("Locomotion", "Middle") |
+      make_panel("Locomotion", "Upper")
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  
+  # ---------------------------------------------------------------
+  # COMBINE ALL ROWS
+  # ---------------------------------------------------------------
+  
+  combined_figure <- (
+    row_diet /
+      row_body /
+      row_locomotion
+  ) +
+    plot_annotation(
+      title = paste(
+        "Taxon accumulation by ecological traits",
+        "across sampling heights"
+      ),
+      theme = theme(
+        plot.title = element_text(
+          face = "bold",
+          hjust = 0.5,
+          size = 21,
+          margin = margin(b = 15)
+        )
+      )
+    )
+  
+  
+  # ================================================================
+  # 12. SAVE PUBLICATION-QUALITY FIGURES
+  # ================================================================
+  
+  png_path <- file.path(
+    output_dir,
+    "Figure_iNEXT_traits_by_height_600dpi.png"
+  )
+  
+  pdf_path <- file.path(
+    output_dir,
+    "Figure_iNEXT_traits_by_height_vector.pdf"
+  )
+  
+  
+  # ---------------------------------------------------------------
+  # SAVE PNG: 600 DPI
+  # ---------------------------------------------------------------
+  
+  ggsave(
+    filename = png_path,
+    plot = combined_figure,
+    width = 17,
+    height = 16,
+    units = "in",
+    dpi = 600,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  
+  # ---------------------------------------------------------------
+  # SAVE PDF: VECTOR FORMAT
+  # ---------------------------------------------------------------
+  
+  ggsave(
+    filename = pdf_path,
+    plot = combined_figure,
+    width = 17,
+    height = 16,
+    units = "in",
+    device = grDevices::cairo_pdf,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  
+  # ---------------------------------------------------------------
+  # DISPLAY FINAL FIGURE
+  # ---------------------------------------------------------------
+  
+  print(combined_figure)
+  
+  cat(
+    "\nANALYSIS COMPLETE",
+    "\nPNG: ", png_path,
+    "\nPDF: ", pdf_path,
+    "\nDiagnostics: ",
+    file.path(output_dir, "iNEXT_fit_diagnostics.csv"),
+    "\n",
+    sep = ""
+  )
+  
+
+
