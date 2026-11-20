@@ -1,0 +1,213 @@
+# ============================================================================
+# INCIDENCE-BASED COMMUNITY-WEIGHTED MEAN (CWM): MAMMAL VERTICAL HABITAT HEIGHT
+# Exploratory analysis — trait heights are provisional, NOT literature validated.
+# Inputs: two marker read tables and provisional vertical-height trait workbook.
+# Outputs: per-swab CWM, coverage audit, model tests, post-hoc tests, figure.
+# ============================================================================
+
+# 01. INSTALL (IF NEEDED) AND LOAD THE PACKAGES.
+packages <- c('readxl', 'dplyr', 'tidyr', 'stringr', 'ggplot2',
+              'lme4', 'lmerTest', 'emmeans', 'DHARMa', 'readr')
+missing_packages <- setdiff(packages, rownames(installed.packages()))
+if (length(missing_packages)) install.packages(missing_packages)
+invisible(lapply(packages, library, character.only = TRUE))
+
+# 02. SET INPUT FILES. Keep the three Excel files in the working directory.
+file_12s <- 'Combined_12S_read_table.xlsx'
+file_16s <- 'Combined_16S_read_table.xlsx'
+file_traits <- 'Vertical_Habitat_Height_All_Taxa_PROVISIONAL.xlsx'
+output_dir <- 'CWM_Mammals_No_BadPattern_No_Control_Output'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 03. READ THE INPUT TABLES AND CHECK REQUIRED COLUMNS.
+r12 <- readxl::read_excel(file_12s)
+r16 <- readxl::read_excel(file_16s)
+traits <- readxl::read_excel(file_traits, sheet = 'Vertical_height_traits')
+required_reads <- c('Class', 'Species', 'Note')
+required_traits <- c('Class', 'Taxon', 'Average vertical height (m)',
+                     'Lower plausible height (m)', 'Upper plausible height (m)', 'Eligibility')
+stopifnot(all(required_reads %in% names(r12)),
+          all(required_reads %in% names(r16)),
+          all(required_traits %in% names(traits)))
+
+# 04. IDENTIFY FIELD SAMPLES BY NAME; EXCLUDE ALL CONTROLS AUTOMATICALLY.
+# Expected sample names: SWN_Lower_1, BBI_Middle_2, etc.
+sample_regex <- '^[A-Za-z0-9]+_(Lower|Middle|Upper)_[0-9]+$'
+samples12 <- grep(sample_regex, names(r12), value = TRUE)
+samples16 <- grep(sample_regex, names(r16), value = TRUE)
+if (!setequal(samples12, samples16)) stop('12S and 16S field sample names differ.')
+field_samples <- samples12
+cat('Number of field swabs:', length(field_samples), '\n')
+
+# 05. AUDIT EXCLUDED MAMMALIAN ASSIGNMENTS BEFORE ANALYSIS.
+# Only mammalian rows with a BLANK Note are retained.
+# This explicitly removes Bad_pattern / Bad pattern, Control and all other
+# flagged assignments (e.g. human, domestic, NUMTs, uncertain assignments).
+# Negative/positive CONTROL SAMPLE COLUMNS were already removed in Step 04.
+# Export excluded rows so the filtering is fully transparent.
+flagged_mammals <- dplyr::bind_rows(
+  r12 %>% mutate(Marker = '12S'),
+  r16 %>% mutate(Marker = '16S')
+) %>%
+  filter(stringr::str_to_lower(stringr::str_squish(as.character(Class))) == 'mammalia') %>%
+  mutate(Note_clean = stringr::str_squish(dplyr::coalesce(as.character(Note), '')),
+         Exclusion = dplyr::case_when(
+           stringr::str_detect(Note_clean, stringr::regex('bad[ _-]*pattern', ignore_case = TRUE)) ~ 'Bad_pattern',
+           stringr::str_detect(Note_clean, stringr::regex('control', ignore_case = TRUE)) ~ 'Control',
+           Note_clean != '' ~ 'Other_flagged_note',
+           TRUE ~ 'Retained'
+         ))
+readr::write_csv(
+  flagged_mammals %>% select(Marker, Species, Note, Exclusion),
+  file.path(output_dir, 'Mammal_Row_Exclusion_Audit.csv')
+)
+print(flagged_mammals %>% count(Marker, Exclusion))
+
+# 06. RETAIN ONLY UNFLAGGED MAMMALS AND COLLAPSE MARKERS.
+# A blank Note is required. Rows flagged Bad_pattern or Control are excluded.
+prepare_marker <- function(x, marker) {
+  x %>%
+    filter(stringr::str_to_lower(stringr::str_squish(as.character(Class))) == 'mammalia',
+           is.na(Note) | stringr::str_squish(as.character(Note)) == '') %>%
+    mutate(Taxon = str_replace_all(as.character(Species), '_', ' ')) %>%
+    filter(!is.na(Taxon), Taxon != '') %>%
+    select(Taxon, all_of(field_samples)) %>%
+    pivot_longer(cols = all_of(field_samples), names_to = 'SampleID',
+                 values_to = 'Reads') %>%
+    mutate(Reads = suppressWarnings(as.numeric(Reads)),
+           Detection = as.integer(!is.na(Reads) & Reads > 0), Marker = marker) %>%
+    select(Taxon, SampleID, Detection, Marker)
+}
+long_reads <- bind_rows(prepare_marker(r12, '12S'), prepare_marker(r16, '16S'))
+
+# 06. COLLAPSE MULTIPLE OTUs AND BOTH MARKERS TO ONE TAXON x SWAB DETECTION.
+# A taxon is present if it has at least one retained positive read in either marker.
+incidence <- long_reads %>%
+  group_by(Taxon, SampleID) %>%
+  summarise(Detection = max(Detection), .groups = 'drop')
+
+# 07. LOAD THE PROVISIONAL TRAIT HEIGHTS AND EXCLUDE FLAGGED TAXA.
+# Do not interpret these heights as empirical measurements.
+trait_clean <- traits %>%
+  filter(Class == 'Mammalia', Eligibility == 'Candidate: verify final taxon list') %>%
+  transmute(Taxon = str_squish(as.character(Taxon)),
+            Height_mean = as.numeric(`Average vertical height (m)`),
+            Height_low = as.numeric(`Lower plausible height (m)`),
+            Height_high = as.numeric(`Upper plausible height (m)`)) %>%
+  distinct(Taxon, .keep_all = TRUE)
+
+# 08. AUDIT TAXON MATCHING AND EXPORT A COVERAGE REPORT.
+# Any detected mammal without an eligible height estimate is listed explicitly.
+taxon_audit <- incidence %>%
+  group_by(Taxon) %>% summarise(Detected_swabs = sum(Detection), .groups = 'drop') %>%
+  left_join(trait_clean, by = 'Taxon') %>%
+  mutate(Eligible_for_CWM = !is.na(Height_mean))
+readr::write_csv(taxon_audit, file.path(output_dir, 'Taxon_Height_Matching_Audit.csv'))
+cat('Detected mammal taxa:', sum(taxon_audit$Detected_swabs > 0), '\n')
+cat('Detected taxa lacking eligible heights:',
+    sum(taxon_audit$Detected_swabs > 0 & !taxon_audit$Eligible_for_CWM), '\n')
+
+# 09. CALCULATE INCIDENCE-WEIGHTED MEAN HEIGHT PER SWAB.
+# Empty swabs or swabs with no eligible mammalian detections have CWM = NA.
+# Report the number of detected taxa omitted because heights are unavailable.
+incidence_height <- incidence %>% left_join(trait_clean, by = 'Taxon')
+sample_metadata <- tibble(SampleID = field_samples) %>%
+  tidyr::extract(SampleID, into = c('Location', 'Height', 'PlotNumber'),
+                 regex = '^([^_]+)_(Lower|Middle|Upper)_([0-9]+)$',
+                 remove = FALSE) %>%
+  mutate(Height = factor(Height, levels = c('Lower', 'Middle', 'Upper')),
+         PlotID = paste(Location, PlotNumber, sep = '_'))
+calculate_cwm <- function(height_column) {
+  incidence_height %>%
+    group_by(SampleID) %>%
+    summarise(n_mammal_detected = sum(Detection),
+              n_with_height = sum(Detection == 1 & !is.na(.data[[height_column]])),
+              n_missing_height = sum(Detection == 1 & is.na(.data[[height_column]])),
+              CWM = if (sum(Detection == 1 & !is.na(.data[[height_column]])) > 0)
+                mean(.data[[height_column]][Detection == 1 & !is.na(.data[[height_column]])])
+                else NA_real_, .groups = 'drop') %>%
+    right_join(sample_metadata, by = 'SampleID')
+}
+cwm <- calculate_cwm('Height_mean')
+readr::write_csv(cwm, file.path(output_dir, 'CWM_Mammals_Per_Swab.csv'))
+
+# 10. SUMMARISE THE CWM DISTRIBUTION AND MISSINGNESS BY SAMPLING HEIGHT.
+summary_height <- cwm %>% group_by(Height) %>%
+  summarise(n_field_swabs = n(), n_with_mammal_CWM = sum(!is.na(CWM)),
+            n_without_mammal_CWM = sum(is.na(CWM)),
+            mean_CWM_m = mean(CWM, na.rm = TRUE),
+            median_CWM_m = median(CWM, na.rm = TRUE),
+            sd_CWM_m = sd(CWM, na.rm = TRUE), .groups = 'drop')
+print(summary_height)
+readr::write_csv(summary_height, file.path(output_dir, 'CWM_Summary_By_Height.csv'))
+
+# 11. FIT A MIXED MODEL FOR CWM, ADJUSTING FOR LOCATION AND REPEATED PLOTS.
+# Gaussian model is exploratory; inspect residuals before interpreting tests.
+# Samples with undefined CWM are excluded, not coded as zero.
+model_data <- cwm %>% filter(is.finite(CWM)) %>%
+  mutate(Location = factor(Location), PlotID = factor(PlotID))
+if (n_distinct(model_data$Height) < 2 || n_distinct(model_data$PlotID) < 3)
+  stop('Insufficient samples/plots with defined CWM for a mixed model.')
+fit_full <- lmerTest::lmer(CWM ~ Height + Location + (1 | PlotID),
+                          data = model_data, REML = FALSE)
+fit_null <- lmerTest::lmer(CWM ~ Location + (1 | PlotID),
+                          data = model_data, REML = FALSE)
+height_LRT <- anova(fit_null, fit_full)
+print(height_LRT)
+write.csv(as.data.frame(height_LRT),
+          file.path(output_dir, 'CWM_Height_Likelihood_Ratio_Test.csv'))
+
+# 12. COMPARE HEIGHTS USING MODEL-BASED ESTIMATED MARGINAL MEANS.
+# Holm correction covers all three pairwise comparisons.
+emm <- emmeans::emmeans(fit_full, ~ Height)
+posthoc <- as.data.frame(summary(pairs(emm, adjust = 'holm')))
+print(posthoc)
+readr::write_csv(posthoc, file.path(output_dir, 'CWM_Height_Posthoc_Holm.csv'))
+readr::write_csv(as.data.frame(summary(emm, infer = TRUE)),
+                 file.path(output_dir, 'CWM_Estimated_Marginal_Means.csv'))
+
+# 13. CHECK MODEL DIAGNOSTICS; ALSO INSPECT RESIDUALS VISUALLY.
+pdf(file.path(output_dir, 'CWM_Model_Diagnostics.pdf'), width = 9, height = 6)
+plot(fit_full)
+qqnorm(residuals(fit_full)); qqline(residuals(fit_full))
+sim <- DHARMa::simulateResiduals(fittedModel = fit_full, n = 500, plot = FALSE)
+plot(sim)
+dev.off()
+cat('Singular model:', lme4::isSingular(fit_full), '\n')
+
+# 14. PLOT OBSERVED SAMPLE-LEVEL CWM BY VEGETATION HEIGHT.
+# Points = swabs; boxplots summarise distributions; no significance inferred.
+figure <- ggplot(model_data, aes(x = Height, y = CWM)) +
+  geom_boxplot(width = 0.56, outlier.shape = NA, fill = 'grey90') +
+  geom_jitter(width = 0.13, height = 0, alpha = 0.45, size = 1.5) +
+  labs(x = 'Vegetation sampling height',
+       y = 'Incidence-based CWM of mammalian habitat height (m)',
+       subtitle = 'Exploratory analysis using provisional species-height estimates') +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+print(figure)
+ggsave(file.path(output_dir, 'CWM_Mammals_By_Height.png'), figure,
+       width = 7, height = 5, dpi = 600)
+ggsave(file.path(output_dir, 'CWM_Mammals_By_Height.pdf'), figure,
+       width = 7, height = 5)
+
+# 15. SENSITIVITY ANALYSIS: REPEAT CWM USING LOW/HIGH PLAUSIBLE HEIGHTS.
+# These are structured alternative assumptions, NOT statistical confidence bounds.
+for (scenario in c('Height_low', 'Height_high')) {
+  tmp <- calculate_cwm(scenario) %>% filter(is.finite(CWM)) %>%
+    mutate(Location = factor(Location), PlotID = factor(PlotID))
+  if (n_distinct(tmp$Height) < 2) next
+  fit <- lmerTest::lmer(CWM ~ Height + Location + (1 | PlotID),
+                        data = tmp, REML = FALSE)
+  null <- lmerTest::lmer(CWM ~ Location + (1 | PlotID),
+                         data = tmp, REML = FALSE)
+  readr::write_csv(as.data.frame(summary(pairs(
+    emmeans::emmeans(fit, ~ Height), adjust = 'holm'))),
+    file.path(output_dir, paste0('Sensitivity_', scenario, '_Posthoc.csv')))
+  write.csv(as.data.frame(anova(null, fit)),
+            file.path(output_dir, paste0('Sensitivity_', scenario, '_LRT.csv')))
+}
+
+# 16. FINISH: REVIEW AUDIT, RESIDUALS AND SENSITIVITY BEFORE PUBLICATION.
+cat('\nFinished. Outputs saved to:', normalizePath(output_dir), '\n')
+cat('WARNING: All species habitat heights are provisional ecological estimates.\n')
