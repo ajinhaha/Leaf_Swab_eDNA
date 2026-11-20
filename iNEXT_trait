@@ -275,353 +275,222 @@ write.csv(ci_diag, file.path(output_dir, "confidence_interval_diagnostics.csv"),
 print(ci_diag %>% filter(Trait == "Locomotion", Height == "Middle"), n = Inf)
 
 
+# ================================================================
+# 10. PLOT EACH TRAIT x HEIGHT PANEL
+# ================================================================
+# Requires existing objects: curves_df, trait_palettes, height_labels,
+# height_levels, output_dir. No iNEXT models are rerun.
 
-  # ================================================================
-  # 10. PLOT EACH TRAIT × HEIGHT PANEL
-  # ================================================================
-  # Larger text and thicker lines for publication-quality figures.
-  # Solid = rarefaction; dashed = extrapolation.
-  # Shaded ribbons = 95% confidence intervals.
-  # Points = observed sample size.
-  
-  make_panel <- function(trait_name, height, panel_tag = NULL) {
-    
-    dat <- curves_df %>%
-      filter(Trait == trait_name, Height == height)
-    
-    palette <- trait_palettes[[trait_name]]
-    
-    # Include any unexpected category labels.
-    extra <- setdiff(unique(dat$Assemblage), names(palette))
-    
-    if (length(extra)) {
-      warning(
-        "Unrecognised ", trait_name, " categories: ",
-        paste(extra, collapse = ", ")
-      )
-      
-      palette <- c(
-        palette,
-        setNames(
-          grDevices::hcl.colors(length(extra), "Dark 3"),
-          extra
-        )
-      )
-    }
-    
-    dat$Assemblage <- factor(
-      dat$Assemblage,
-      levels = names(palette)
-    )
-    
-    # Separate curve types.
-    lines <- dat %>%
-      filter(Method %in% c("Rarefaction", "Extrapolation"))
-    
-    ribbons <- lines %>%
-      filter(
-        is.finite(CI_lower),
-        is.finite(CI_upper)
-      )
-    
-    observed <- dat %>%
-      filter(Method == "Observed")
-    
-    # --------------------------------------------------------------
-    # BUILD PLOT
-    # --------------------------------------------------------------
-    
-    p <- ggplot() +
-      
-      # 95% confidence interval ribbons
-      geom_ribbon(
-        data = ribbons,
-        aes(
-          x = t,
-          ymin = CI_lower,
-          ymax = CI_upper,
-          fill = Assemblage,
-          group = interaction(Assemblage, Method)
-        ),
-        alpha = 0.14,
-        colour = NA,
-        show.legend = FALSE
-      ) +
-      
-      # Rarefaction and extrapolation curves
-      geom_line(
-        data = lines,
-        aes(
-          x = t,
-          y = qD,
-          colour = Assemblage,
-          linetype = Method,
-          group = interaction(Assemblage, Method)
-        ),
-        linewidth = 1.05,
-        na.rm = TRUE
-      ) +
-      
-      # Observed richness
-      geom_point(
-        data = observed,
-        aes(
-          x = t,
-          y = qD,
-          colour = Assemblage
-        ),
-        size = 2.5,
-        na.rm = TRUE,
-        show.legend = FALSE
-      ) +
-      
-      # Fixed colours across heights
-      scale_colour_manual(
-        values = palette,
-        drop = FALSE,
-        name = trait_name
-      ) +
-      
-      scale_fill_manual(
-        values = palette,
-        drop = FALSE
-      ) +
-      
-      # Curve types
-      scale_linetype_manual(
-        values = c(
-          Rarefaction = "solid",
-          Extrapolation = "dashed"
-        ),
-        breaks = c(
-          "Rarefaction",
-          "Extrapolation"
-        ),
-        name = "Curve"
-      ) +
-      
-      # Axis and panel titles
-      labs(
-        title = height_labels[
-          match(height, height_levels)
-        ],
-        x = "Number of leaf-swab samples",
-        y = "Taxon richness"
-      ) +
-      
-      # ------------------------------------------------------------
-    # FONT SIZE SETTINGS
-    # ------------------------------------------------------------
-    
-    theme_bw(base_size = 14) +
-      
-      theme(
-        # Panel background and grid
-        panel.grid.minor = element_blank(),
-        panel.grid.major = element_line(
-          colour = "grey92",
-          linewidth = 0.2
-        ),
-        
-        # Panel title: Lower, Middle, Upper
-        plot.title = element_text(
-          face = "bold",
-          hjust = 0.5,
-          size = 16,
-          margin = margin(b = 8)
-        ),
-        
-        # Axis titles
-        axis.title.x = element_text(
-          size = 14,
-          margin = margin(t = 8)
-        ),
-        
-        axis.title.y = element_text(
-          size = 14,
-          margin = margin(r = 8)
-        ),
-        
-        # Axis tick labels
-        axis.text.x = element_text(size = 12),
-        axis.text.y = element_text(size = 12),
-        
-        # Legend titles
-        legend.title = element_text(
-          face = "bold",
-          size = 14
-        ),
-        
-        # Legend category labels
-        legend.text = element_text(
-          size = 12
-        ),
-        
-        # Legend spacing
-        legend.key.width = grid::unit(1.2, "cm"),
-        legend.spacing.x = grid::unit(0.3, "cm"),
-        
-        # Panel spacing
-        plot.margin = margin(8, 8, 8, 8)
-      )
-    
-    # --------------------------------------------------------------
-    # ADD BOLD PANEL TAGS: A, B, C
-    # --------------------------------------------------------------
-    
-    if (!is.null(panel_tag)) {
-      
-      p <- p +
-        labs(tag = panel_tag) +
-        theme(
-          plot.tag = element_text(
-            face = "bold",
-            size = 22
-          )
-        )
-    }
-    
-    return(p)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+make_panel <- function(trait_name, height, panel_tag = NULL) {
+  dat <- curves_df %>% filter(Trait == trait_name, Height == height)
+  if (nrow(dat) == 0L) stop("No curves for ", trait_name, " / ", height)
+  palette <- trait_palettes[[trait_name]]
+  extra <- setdiff(unique(as.character(dat$Assemblage)), names(palette))
+  if (length(extra)) {
+    warning("Unrecognised ", trait_name, " categories: ", paste(extra, collapse = ", "))
+    palette <- c(palette, setNames(grDevices::hcl.colors(length(extra), "Dark 3"), extra))
   }
+  dat$Assemblage <- factor(dat$Assemblage, levels = names(palette))
+  lines <- dat %>% filter(Method %in% c("Rarefaction", "Extrapolation"))
+  ribbons <- lines %>% filter(is.finite(CI_lower), is.finite(CI_upper))
+  observed <- dat %>% filter(Method == "Observed")
   
+  # Fix category ordering and guide structure identically in all panels.
+  # Two-row category legends prevent the six-item Diet legend from
+  # being squeezed into differently wrapped legends in patchwork.
+  category_guide <- guide_legend(
+    order = 1,
+    nrow = 2,
+    byrow = TRUE,
+    override.aes = list(linewidth = 1.1)
+  )
   
-  # ================================================================
-  # 11. COMBINE 3 ROWS × 3 COLUMNS
-  # ================================================================
-  # Row A = Diet
-  # Row B = Body size
-  # Row C = Locomotion
-  #
-  # Each row has its own collected legend.
-  
-  library(patchwork)
-  
-  # ---------------------------------------------------------------
-  # ROW A: DIET
-  # ---------------------------------------------------------------
-  
-  row_diet <- (
-    make_panel("Diet", "Lower", "A") |
-      make_panel("Diet", "Middle") |
-      make_panel("Diet", "Upper")
-  ) +
-    plot_layout(guides = "collect") &
-    theme(legend.position = "bottom")
-  
-  
-  # ---------------------------------------------------------------
-  # ROW B: BODY SIZE
-  # ---------------------------------------------------------------
-  
-  row_body <- (
-    make_panel("Body_size", "Lower", "B") |
-      make_panel("Body_size", "Middle") |
-      make_panel("Body_size", "Upper")
-  ) +
-    plot_layout(guides = "collect") &
-    theme(legend.position = "bottom")
-  
-  
-  # ---------------------------------------------------------------
-  # ROW C: LOCOMOTION
-  # ---------------------------------------------------------------
-  
-  row_locomotion <- (
-    make_panel("Locomotion", "Lower", "C") |
-      make_panel("Locomotion", "Middle") |
-      make_panel("Locomotion", "Upper")
-  ) +
-    plot_layout(guides = "collect") &
-    theme(legend.position = "bottom")
-  
-  
-  # ---------------------------------------------------------------
-  # COMBINE ALL ROWS
-  # ---------------------------------------------------------------
-  
-  combined_figure <- (
-    row_diet /
-      row_body /
-      row_locomotion
-  ) +
-    plot_annotation(
-      title = paste(
-        "Taxon accumulation by ecological traits",
-        "across sampling heights"
-      ),
-      theme = theme(
-        plot.title = element_text(
-          face = "bold",
-          hjust = 0.5,
-          size = 21,
-          margin = margin(b = 15)
-        )
-      )
+  p <- ggplot() +
+    geom_ribbon(
+      data = ribbons,
+      aes(x = t, ymin = CI_lower, ymax = CI_upper,
+          fill = Assemblage, group = interaction(Assemblage, Method)),
+      alpha = 0.14, colour = NA, show.legend = FALSE
+    ) +
+    geom_line(
+      data = lines,
+      aes(x = t, y = qD, colour = Assemblage, linetype = Method,
+          group = interaction(Assemblage, Method)),
+      linewidth = 1.05, na.rm = TRUE
+    ) +
+    geom_point(
+      data = observed,
+      aes(x = t, y = qD, colour = Assemblage),
+      size = 2.5, na.rm = TRUE, show.legend = FALSE
+    ) +
+    scale_colour_manual(
+      values = palette, limits = names(palette), breaks = names(palette),
+      drop = FALSE, name = if (trait_name == "Body_size") "Body size" else trait_name
+    ) +
+    scale_fill_manual(
+      values = palette, limits = names(palette), breaks = names(palette),
+      drop = FALSE, guide = "none"
+    ) +
+    scale_linetype_manual(
+      values = c(Rarefaction = "solid", Extrapolation = "dashed"),
+      limits = c("Rarefaction", "Extrapolation"),
+      breaks = c("Rarefaction", "Extrapolation"), name = "Curve"
+    ) +
+    guides(
+      colour = category_guide,
+      linetype = guide_legend(order = 2, nrow = 1)
+    ) +
+    labs(
+      title = height_labels[match(height, height_levels)],
+      x = "Number of leaf-swab samples", y = "Taxon richness"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey92", linewidth = 0.2),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16,
+                                margin = margin(b = 8)),
+      axis.title.x = element_text(size = 14, margin = margin(t = 8)),
+      axis.title.y = element_text(size = 14, margin = margin(r = 8)),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      legend.title = element_text(face = "bold", size = 13),
+      legend.text = element_text(size = 11),
+      legend.key.width = grid::unit(1.0, "cm"),
+      legend.spacing.x = grid::unit(0.2, "cm"),
+      legend.box = "horizontal",
+      legend.position = "bottom",
+      plot.margin = margin(8, 8, 8, 8)
     )
   
+  if (!is.null(panel_tag)) {
+    p <- p + labs(tag = panel_tag) +
+      theme(plot.tag = element_text(face = "bold", size = 22))
+  }
+  p
+}
+
+# ================================================================
+# 11. COMBINE PANELS WITH ONE LEGEND PER TRAIT
+# ================================================================
+
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+
+# Build one row containing:
+# - Three height panels
+# - One shared legend underneath
+
+build_row <- function(trait_name, tag) {
   
-  # ================================================================
-  # 12. SAVE PUBLICATION-QUALITY FIGURES
-  # ================================================================
-  
-  png_path <- file.path(
-    output_dir,
-    "Figure_iNEXT_traits_by_height_600dpi.png"
+  # Create three panels
+  plots <- list(
+    make_panel(trait_name, "Lower", tag),
+    make_panel(trait_name, "Middle"),
+    make_panel(trait_name, "Upper")
   )
   
-  pdf_path <- file.path(
-    output_dir,
-    "Figure_iNEXT_traits_by_height_vector.pdf"
+  # Extract legend from Middle panel
+  legend <- cowplot::get_legend(
+    plots[[2]] +
+      theme(legend.position = "bottom")
   )
   
-  
-  # ---------------------------------------------------------------
-  # SAVE PNG: 600 DPI
-  # ---------------------------------------------------------------
-  
-  ggsave(
-    filename = png_path,
-    plot = combined_figure,
-    width = 17,
-    height = 16,
-    units = "in",
-    dpi = 600,
-    bg = "white",
-    limitsize = FALSE
+  # Remove legends from all three panels
+  plots <- lapply(
+    plots,
+    function(p) p + theme(legend.position = "none")
   )
   
-  
-  # ---------------------------------------------------------------
-  # SAVE PDF: VECTOR FORMAT
-  # ---------------------------------------------------------------
-  
-  ggsave(
-    filename = pdf_path,
-    plot = combined_figure,
-    width = 17,
-    height = 16,
-    units = "in",
-    device = grDevices::cairo_pdf,
-    bg = "white",
-    limitsize = FALSE
+  # Combine three panels horizontally
+  panels <- cowplot::plot_grid(
+    plotlist = plots,
+    ncol = 3,
+    align = "hv",
+    axis = "tblr"
   )
   
-  
-  # ---------------------------------------------------------------
-  # DISPLAY FINAL FIGURE
-  # ---------------------------------------------------------------
-  
-  print(combined_figure)
-  
-  cat(
-    "\nANALYSIS COMPLETE",
-    "\nPNG: ", png_path,
-    "\nPDF: ", pdf_path,
-    "\nDiagnostics: ",
-    file.path(output_dir, "iNEXT_fit_diagnostics.csv"),
-    "\n",
-    sep = ""
+  # Combine panels and their shared legend vertically
+  cowplot::plot_grid(
+    panels,
+    legend,
+    ncol = 1,
+    rel_heights = c(1, 0.18)
   )
-  
+}
 
 
+# ================================================================
+# CREATE THREE TRAIT ROWS
+# ================================================================
+
+row_diet <- build_row("Diet", "A")
+
+row_body <- build_row("Body_size", "B")
+
+row_locomotion <- build_row("Locomotion", "C")
+
+
+# ================================================================
+# COMBINE THREE ROWS INTO ONE FIGURE
+# ================================================================
+
+combined_panels <- cowplot::plot_grid(
+  row_diet,
+  row_body,
+  row_locomotion,
+  ncol = 1,
+  rel_heights = c(1, 1, 1)
+)
+
+# Add main title
+combined_figure <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    combined_panels,
+    x = 0,
+    y = 0,
+    width = 1,
+    height = 0.955
+  ) +
+  cowplot::draw_label(
+    "Taxon accumulation by ecological traits across sampling heights",
+    x = 0.5,
+    y = 0.985,
+    fontface = "bold",
+    size = 21,
+    hjust = 0.5,
+    vjust = 0.5
+  )
+
+# ================================================================
+# 12. SAVE FIGURES
+# ================================================================
+
+ggsave(
+  png_path,
+  plot = combined_figure,
+  width = 17,
+  height = 16,
+  units = "in",
+  dpi = 600,
+  bg = "white",
+  limitsize = FALSE
+)
+
+ggsave(
+  pdf_path,
+  plot = combined_figure,
+  width = 17,
+  height = 16,
+  units = "in",
+  device = grDevices::cairo_pdf,
+  bg = "white",
+  limitsize = FALSE
+)
+
+print(combined_figure)
