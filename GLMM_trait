@@ -1,1 +1,656 @@
+# ============================================================================
+# LEAF-SWAB eDNA | NINE VERTEBRATE ECOLOGICAL TRAIT GLMMs | COMPLETE SCRIPT
+# ============================================================================
+# PURPOSE: Run nine vertebrate trait models (diet, body size, locomotion)
+# using combined binary 12S + 16S detections.
+# Unit of analysis: taxon x leaf-swab sample; 288 biological swabs expected.
+# Model: Detection ~ Height * Group + Location +
+#                    (1|Taxon) + (1|PlotID) + (1|SampleID)
+# Family: binomial (logit), fitted with glmmTMB.
+# IMPORTANT: Trait category is a taxon-level characteristic. Each taxon belongs
+# to ONE group per trait, so Taxon random intercept accounts for repeated taxa.
+# Location is a site effect, NOT a replicated forest-condition treatment.
+# Outputs: model comparison tables, emmeans, figures, diagnostics, RDS files.
+# ============================================================================
+
+# 01. INSTALL REQUIRED PACKAGES ONCE (uncomment if needed) --------------------
+# install.packages(c("readxl", "dplyr", "tidyr", "stringr", "ggplot2",
+#                    "glmmTMB", "emmeans", "DHARMa", "cowplot", "scales"))
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(glmmTMB)
+  library(emmeans)
+  library(cowplot)
+  library(scales)
+})
+
+# 02. USER SETTINGS ----------------------------------------------------------
+setwd("C:/Users/Fajrin/Desktop/Analysis_manuscript/")
+input_12s <- "Combined_12S_read_table.xlsx"
+input_16s <- "Combined_16S_read_table.xlsx"
+input_traits <- "Leaf_swab_taxa_ecological_traits.xlsx"
+output_dir <- "figures/GLMM_nine_vertebrate_analyses"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+set.seed(123)
+height_levels <- c("Lower", "Middle", "Upper")
+height_labels <- c("Lower (<1 m)", "Middle (1.3–1.5 m)", "Upper (2–2.5 m)")
+location_levels <- c("SWN", "BBI", "SBJ", "KRB", "SLP")
+# Nine requested analyses: Mammals = Mammalia, Birds = Aves, All = all five vertebrate classes.
+analyses <- tibble::tribble(
+  ~Analysis,          ~Scope,     ~Trait,
+  "Mammals_Diet",      "Mammals",  "Diet",
+  "Birds_Diet",        "Birds",    "Diet",
+  "All_Diet",          "All",      "Diet",
+  "Mammals_Locomotion", "Mammals", "Locomotion",
+  "Birds_Locomotion",   "Birds",   "Locomotion",
+  "All_Locomotion",    "All",      "Locomotion",
+  "Mammals_Body_size", "Mammals",  "Body_size",
+  "Birds_Body_size",   "Birds",    "Body_size",
+  "All_Body_size",     "All",      "Body_size"
+)
+trait_names <- c("Diet", "Body_size", "Locomotion")
+
+# 03. READ INPUT DATA --------------------------------------------------------
+required_files <- c(input_12s, input_16s, input_traits)
+if (any(!file.exists(required_files))) {
+  stop("Missing files: ", paste(required_files[!file.exists(required_files)], collapse = ", "))
+}
+otu_12s <- read_excel(input_12s)
+otu_16s <- read_excel(input_16s)
+traits_raw <- read_excel(input_traits)
+names(otu_12s) <- trimws(names(otu_12s))
+names(otu_16s) <- trimws(names(otu_16s))
+names(traits_raw) <- trimws(names(traits_raw))
+
+# 04. IDENTIFY BIOLOGICAL SWABS; EXCLUDE CONTROLS -----------------------------
+sample_pattern <- "^(SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_.+$"
+sample_columns <- sort(union(
+  names(otu_12s)[str_detect(names(otu_12s), sample_pattern)],
+  names(otu_16s)[str_detect(names(otu_16s), sample_pattern)]
+))
+if (length(sample_columns) != 288L) {
+  warning("Expected 288 samples, found ", length(sample_columns),
+          ". Inspect sample names before interpreting results.")
+}
+if (!length(sample_columns)) stop("No biological sample columns detected.")
+
+# 05. COMBINE 12S AND 16S TAXON DETECTIONS -----------------------------------
+normalise_taxon <- function(x) {
+  x <- str_trim(as.character(x))
+  x[x %in% c("", "NA", "NaN")] <- NA_character_
+  x
+}
+exclude_notes <- "Control|No_Borneo_Record|No_Taxa|Below_Genus|NUMTs|Human|Domestic_Animal"
+
+prepare_marker <- function(df, marker) {
+  needed <- c("Genus", "Species", "Note")
+  if (!all(needed %in% names(df))) {
+    stop(marker, " missing columns: ", paste(setdiff(needed, names(df)), collapse = ", "))
+  }
+  for (s in setdiff(sample_columns, names(df))) df[[s]] <- 0
+  df <- df %>%
+    filter(!str_detect(coalesce(as.character(Note), ""),
+                       regex(exclude_notes, ignore_case = TRUE))) %>%
+    mutate(
+      Genus = normalise_taxon(Genus),
+      Species = normalise_taxon(Species),
+      Taxon = if_else(!is.na(Species), Species,
+                      if_else(!is.na(Genus), paste0(Genus, "_sp."), NA_character_))
+    ) %>%
+    filter(!is.na(Taxon))
+  df[sample_columns] <- lapply(df[sample_columns], function(z) {
+    z0 <- as.character(z)
+    z <- suppressWarnings(as.numeric(z0))
+    if (any(!is.na(z0) & trimws(z0) != "" & is.na(z))) {
+      warning(marker, ": some nonnumeric counts were converted to zero")
+    }
+    z[is.na(z)] <- 0
+    if (any(!is.finite(z) | z < 0)) stop("Invalid counts in ", marker)
+    z
+  })
+  df %>% group_by(Taxon) %>%
+    summarise(across(all_of(sample_columns), ~sum(.x)), .groups = "drop")
+}
+
+combined_reads <- bind_rows(
+  prepare_marker(otu_12s, "12S"),
+  prepare_marker(otu_16s, "16S")
+) %>% group_by(Taxon) %>%
+  summarise(across(all_of(sample_columns), ~sum(.x)), .groups = "drop")
+
+# 06. MATCH ECOLOGICAL TRAITS ------------------------------------------------
+find_column <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (!length(hit)) stop("Missing trait column; looked for: ",
+                         paste(candidates, collapse = ", "))
+  hit[1]
+}
+trait_data <- tibble(
+  Taxon = normalise_taxon(traits_raw[[find_column(traits_raw, "Taxon")]]),
+  Diet = normalise_taxon(traits_raw[[find_column(traits_raw, "Diet")]]),
+  Body_size = normalise_taxon(traits_raw[[find_column(
+    traits_raw, c("Body-size class", "Body_size", "Body size class"))]]),
+  Locomotion = normalise_taxon(traits_raw[[find_column(traits_raw, "Locomotion")]])
+) %>% filter(!is.na(Taxon))
+if (anyDuplicated(trait_data$Taxon)) stop("Duplicated Taxon entries in trait table")
+trait_data$Locomotion[trait_data$Taxon %in%
+  c("Balionycteris_maculata", "Mops_plicatus")] <- "Chiropteran volant"
+write.csv(anti_join(combined_reads, trait_data, by = "Taxon") %>% select(Taxon),
+          file.path(output_dir, "unmatched_taxa.csv"), row.names = FALSE)
+matched <- inner_join(combined_reads, trait_data, by = "Taxon")
+# Determine taxonomic class from the trait table or either marker table.
+# Do not infer mammal/bird status from diet, locomotion, or taxon names.
+class_candidates <- c("Class", "class", "Taxonomic_class", "Taxonomic class")
+get_class_map <- function(df, source_name) {
+  class_col <- intersect(class_candidates, names(df))
+  if (!length(class_col)) return(NULL)
+  if ("Taxon" %in% names(df)) {
+    taxon <- normalise_taxon(df$Taxon)
+  } else if (all(c("Genus", "Species") %in% names(df))) {
+    genus <- normalise_taxon(df$Genus)
+    species <- normalise_taxon(df$Species)
+    taxon <- ifelse(!is.na(species), species,
+                    ifelse(!is.na(genus), paste0(genus, "_sp."), NA_character_))
+  } else {
+    stop("Class column found in ", source_name,
+         " but Taxon or Genus/Species columns are missing")
+  }
+  tibble(Taxon = taxon,
+         Class_raw = trimws(as.character(df[[class_col[1]]])),
+         Source = source_name) %>%
+    filter(!is.na(Taxon), !is.na(Class_raw), nzchar(Class_raw))
+}
+class_maps <- bind_rows(
+  get_class_map(traits_raw, "traits"),
+  get_class_map(otu_12s, "12S"),
+  get_class_map(otu_16s, "16S")
+)
+if (!nrow(class_maps)) {
+  stop("No Class column found in the trait or marker Excel files. ",
+       "Add a Class column (Mammalia/Aves/Actinopterygii/Amphibia/Reptilia) to Leaf_swab_taxa_ecological_traits.xlsx ",
+       "and rerun. No taxonomic identities have been guessed.")
+}
+# Normalize known vertebrate class names; do not silently collapse other classes.
+class_maps <- class_maps %>% mutate(
+  Class = case_when(
+    tolower(Class_raw) %in% c("mammalia", "mammal", "mammals") ~ "Mammalia",
+    tolower(Class_raw) %in% c("aves", "bird", "birds") ~ "Aves",
+    tolower(Class_raw) %in% c("actinopterygii", "actinopteri", "ray-finned fish", "fish", "fishes", "pisces") ~ "Actinopterygii",
+    tolower(Class_raw) %in% c("chondrichthyes", "cartilaginous fish") ~ "Chondrichthyes",
+    tolower(Class_raw) %in% c("amphibia", "amphibian", "amphibians") ~ "Amphibia",
+    tolower(Class_raw) %in% c("reptilia", "reptile", "reptiles") ~ "Reptilia",
+    TRUE ~ NA_character_
+  )
+)
+if (anyNA(class_maps$Class)) {
+  write.csv(class_maps %>% filter(is.na(Class)),
+            file.path(output_dir, "unrecognized_taxonomic_classes.csv"), row.names = FALSE)
+  stop("Unrecognized class labels: see unrecognized_taxonomic_classes.csv. ",
+       "Please standardize class labels rather than silently excluding taxa.")
+}
+class_conflicts <- class_maps %>% group_by(Taxon) %>%
+  summarise(n_classes = n_distinct(Class), .groups = "drop") %>%
+  filter(n_classes > 1)
+if (nrow(class_conflicts)) {
+  write.csv(class_maps %>% semi_join(class_conflicts, by = "Taxon"),
+            file.path(output_dir, "taxonomic_class_conflicts.csv"), row.names = FALSE)
+  stop("Conflicting Class assignments detected; see taxonomic_class_conflicts.csv")
+}
+class_map <- class_maps %>% distinct(Taxon, Class)
+matched <- matched %>% left_join(class_map, by = "Taxon")
+write.csv(matched %>% select(Taxon, Class),
+          file.path(output_dir, "matched_taxonomic_classes.csv"), row.names = FALSE)
+if (anyNA(matched$Class)) {
+  write.csv(matched %>% filter(is.na(Class)) %>% select(Taxon),
+            file.path(output_dir, "missing_taxonomic_classes.csv"), row.names = FALSE)
+  stop("Matched taxa have missing Class assignments; see missing_taxonomic_classes.csv. ",
+       "Complete these before running All analyses so vertebrates are not silently omitted.")
+}
+valid_classes <- c("Mammalia", "Aves", "Actinopterygii", "Chondrichthyes", "Amphibia", "Reptilia")
+matched <- matched %>% filter(Class %in% valid_classes)
+if (!nrow(matched)) stop("No vertebrate taxa found after class filtering")
+message("Vertebrate taxa by class:")
+print(table(matched$Class))
+message("Samples: ", length(sample_columns), "; matched taxa: ", nrow(matched))
+
+# 07. EXTRACT SAMPLE METADATA ------------------------------------------------
+# PlotID is defined by removing the _Lower_ / _Middle_ / _Upper_ substring
+# from the sample name. Verify that each PlotID has exactly three heights.
+meta <- tibble(SampleID = sample_columns) %>%
+  mutate(
+    Location = str_match(SampleID, "^(SWN|BBI|SBJ|KRB|SLP)_")[, 2],
+    Height = str_match(SampleID, "_(Lower|Middle|Upper)_")[, 2],
+    PlotID = str_replace(SampleID, "_(Lower|Middle|Upper)_", "_"),
+    Height = factor(Height, levels = height_levels),
+    Location = factor(Location, levels = location_levels),
+    SampleID = factor(SampleID),
+    PlotID = factor(PlotID)
+  )
+plot_check <- meta %>% count(PlotID, name = "n_heights")
+write.csv(plot_check, file.path(output_dir, "plot_id_check.csv"), row.names = FALSE)
+if (nrow(plot_check) != 96L || any(plot_check$n_heights != 3L)) {
+  stop("Plot pairing failed: expected 96 plots with exactly three heights each. ",
+       "Inspect plot_id_check.csv and correct PlotID extraction before modelling.")
+}
+print(table(meta$Height, meta$Location))
+
+# 08. BUILD TAXON x SAMPLE DETECTION TABLE ----------------------------------
+# Retain zeros for every taxon at every sample; do NOT filter to detections.
+# This ensures binomial models use the correct denominator.
+long_reads <- matched %>%
+  select(Taxon, all_of(sample_columns)) %>%
+  pivot_longer(cols = all_of(sample_columns),
+               names_to = "SampleID", values_to = "Reads") %>%
+  mutate(Detection = as.integer(Reads > 0)) %>%
+  select(Taxon, SampleID, Detection)
+
+long_data <- long_reads %>%
+  left_join(matched %>% select(Taxon, Class, all_of(trait_names)), by = "Taxon") %>%
+  left_join(meta %>% mutate(SampleID = as.character(SampleID)), by = "SampleID") %>%
+  mutate(Taxon = factor(Taxon),
+         SampleID = factor(SampleID),
+         PlotID = factor(PlotID))
+if (anyNA(long_data$Height) || anyNA(long_data$PlotID)) {
+  stop("Sample metadata could not be matched")
+}
+write.csv(long_data %>% count(Height, Location, name = "taxon_sample_rows"),
+          file.path(output_dir, "design_counts.csv"), row.names = FALSE)
+
+# 09. DEFINE TRAIT CATEGORIES AND COLOURS ------------------------------------
+trait_palettes <- list(
+  Diet = c(Omnivore = "#4477AA", Insectivore = "#228833",
+           Frugivore = "#CCBB44", Herbivore = "#EE6677",
+           Carnivore = "#AA3377", Other = "#66CCEE"),
+  Body_size = c(Small = "#4477AA", Medium = "#228833", Large = "#EE7733"),
+  Locomotion = c("Avian volant" = "#4477AA", "Chiropteran volant" = "#AA3377",
+                 Arboreal = "#228833", "Semi-arboreal" = "#CCBB44",
+                 Terrestrial = "#EE7733", Aquatic = "#66CCEE")
+)
+
+# ============================================================================
+# 10. FIT NINE TAXONOMIC-SCOPE-SPECIFIC BINOMIAL GLMMs
+# ============================================================================
+# Full:      Detection ~ Height * Group + Location + random intercepts
+# Additive:  Detection ~ Height + Group + Location + random intercepts
+# No-group:  Detection ~ Height + Location + random intercepts
+# The full-vs-additive LRT tests the Height x Trait interaction.
+# The additive-vs-no-group LRT tests the trait-group effect ONLY under
+# the additive (no interaction) model. Do not call it an unconditional
+# main effect when the interaction is significant.
+# Height comparisons within each group and group comparisons within each
+# height are performed on the log-odds scale with Holm correction.
+
+# Audit which vertebrate classes contribute to each analysis, including missing traits.
+trait_audit <- matched %>% select(Taxon, Class, all_of(trait_names)) %>%
+  pivot_longer(cols = all_of(trait_names), names_to = "Trait", values_to = "Trait_value") %>%
+  group_by(Class, Trait) %>% summarise(
+    Total_taxa = n_distinct(Taxon),
+    Taxa_with_trait = sum(!is.na(Trait_value)),
+    Taxa_missing_trait = sum(is.na(Trait_value)), .groups = "drop"
+  )
+write.csv(trait_audit, file.path(output_dir, "vertebrate_trait_coverage_by_class.csv"), row.names = FALSE)
+
+control <- glmmTMBControl(optCtrl = list(iter.max = 10000, eval.max = 10000))
+results <- list()
+interaction_tables <- list()
+status_tables <- list()
+omnibus_tables <- list()
+pairwise_height_tables <- list()
+pairwise_group_tables <- list()
+diagnostic_tables <- list()
+
+
+for (i in seq_len(nrow(analyses))) {
+  analysis_name <- analyses$Analysis[i]
+  trait_name <- analyses$Trait[i]
+  scope <- analyses$Scope[i]
+  message("\n================ ", analysis_name, " ================")
+
+  dat <- long_data %>%
+    filter(
+      (scope == "All" |
+       (scope == "Mammals" & Class == "Mammalia") |
+       (scope == "Birds" & Class == "Aves")),
+      !is.na(.data[[trait_name]])
+    ) %>%
+    mutate(Group = as.character(.data[[trait_name]]))
+
+  if (!nrow(dat)) {
+    warning("Skipping ", analysis_name, ": no eligible taxa")
+    next
+  }
+  palette <- trait_palettes[[trait_name]]
+  unexpected <- setdiff(unique(dat$Group), names(palette))
+  if (length(unexpected)) {
+    warning(trait_name, ": unexpected categories: ", paste(unexpected, collapse = ", "))
+    palette <- c(palette, setNames(grDevices::hcl.colors(length(unexpected), "Dark 3"), unexpected))
+  }
+  # Exclude Carnivore ONLY from the Mammals_Diet analysis.
+  # Birds_Diet and All_Diet retain Carnivore; all locomotion and body-size models
+  # also retain carnivorous taxa.
+  if (analysis_name == "Mammals_Diet") {
+    removed <- dat %>% filter(tolower(trimws(Group)) == "carnivore") %>%
+      summarise(Taxa = n_distinct(Taxon), Detections = sum(Detection),
+                Trials = n())
+    message("Mammals_Diet exclusion: Carnivore | taxa=", removed$Taxa,
+            " | detections=", removed$Detections,
+            " | taxon-swab rows=", removed$Trials)
+    dat <- dat %>% filter(tolower(trimws(Group)) != "carnivore")
+  }
+  dat <- dat %>% mutate(
+    Group = factor(Group, levels = intersect(names(palette), unique(Group))),
+    Height = factor(Height, levels = height_levels),
+    Location = factor(Location, levels = location_levels)
+  ) %>% droplevels()
+
+  # Preserve all zeros; the denominator is all swabs per taxon.
+  counts <- dat %>% group_by(Group) %>% summarise(
+    Taxa = n_distinct(Taxon),
+    Detections = sum(Detection),
+    Trials = n(),
+    .groups = "drop"
+  )
+  write.csv(counts, file.path(output_dir, paste0(analysis_name, "_category_counts.csv")), row.names = FALSE)
+  class_counts <- dat %>% group_by(Class) %>% summarise(
+    Taxa = n_distinct(Taxon), Detections = sum(Detection), Trials = n(), .groups = "drop")
+  write.csv(class_counts, file.path(output_dir,
+            paste0(analysis_name, "_class_counts.csv")), row.names = FALSE)
+  message("Class composition of ", analysis_name, ":")
+  print(class_counts)
+  print(counts)
+  if (sum(dat$Detection) == 0L) {
+    warning("Skipping ", analysis_name, ": no detections")
+    next
+  }
+  if (any(counts$Detections == 0)) {
+    warning(trait_name, ": a category has no detections; inspect category counts.")
+  }
+  if (nlevels(dat$Group) < 2L) {
+    warning("Skipping ", analysis_name, ": fewer than two groups")
+    next
+  }
+
+  full_formula <- Detection ~ Height * Group + Location +
+    (1 | Taxon) + (1 | PlotID) + (1 | SampleID)
+  additive_formula <- Detection ~ Height + Group + Location +
+    (1 | Taxon) + (1 | PlotID) + (1 | SampleID)
+  no_group_formula <- Detection ~ Height + Location +
+    (1 | Taxon) + (1 | PlotID) + (1 | SampleID)
+
+  safe_fit <- function(formula) {
+    tryCatch(glmmTMB(formula, data = dat, family = binomial(), control = control),
+             error = function(e) { warning(conditionMessage(e)); NULL })
+  }
+  full <- safe_fit(full_formula)
+  additive <- safe_fit(additive_formula)
+  no_group <- safe_fit(no_group_formula)
+
+  is_valid <- function(m) {
+    !is.null(m) && identical(m$fit$convergence, 0L) && isTRUE(m$sdr$pdHess)
+  }
+  status <- data.frame(
+    Analysis = analysis_name, Scope = scope, Trait = trait_name,
+    Model = c("Full", "Additive", "No_group"),
+    Converged = vapply(list(full, additive, no_group), is_valid, logical(1)),
+    N_taxa = n_distinct(dat$Taxon),
+    N_swabs = n_distinct(dat$SampleID),
+    N_taxon_swab_rows = nrow(dat)
+  )
+  status_tables[[analysis_name]] <- status
+  print(status)
+
+  # Save the models even if one fails diagnostics.
+  saveRDS(list(full = full, additive = additive, no_group = no_group),
+          file.path(output_dir, paste0(analysis_name, "_models.rds")))
+
+  if (!is_valid(full) || !is_valid(additive)) {
+    warning(trait_name, ": invalid full/additive fit; inference and figure skipped.")
+    next
+  }
+
+  interaction_lrt <- as.data.frame(anova(additive, full))
+  interaction_tables[[analysis_name]] <- data.frame(
+    Analysis = analysis_name, Scope = scope, Trait = trait_name,
+    Test = "Height x Trait interaction",
+    Chi_square = interaction_lrt$Chisq[2],
+    Df = interaction_lrt$`Chi Df`[2],
+    P = interaction_lrt$`Pr(>Chisq)`[2]
+  )
+  print(interaction_tables[[analysis_name]])
+
+  # Omnibus tests: interpret additive-model main effects only when
+  # interaction is not supported. The group test is not unconditional.
+  if (is_valid(no_group)) {
+    group_lrt <- as.data.frame(anova(no_group, additive))
+    group_test <- data.frame(
+      Analysis = analysis_name, Scope = scope, Trait = trait_name,
+      Test = "Group effect under additive model (no interaction)",
+      Chi_square = group_lrt$Chisq[2],
+      Df = group_lrt$`Chi Df`[2],
+      P = group_lrt$`Pr(>Chisq)`[2]
+    )
+    omnibus_tables[[paste0(analysis_name, "_group")]] <- group_test
+    write.csv(group_test,
+      file.path(output_dir, paste0(analysis_name, "_group_effect_additive_LRT.csv")),
+      row.names = FALSE)
+  }
+  no_height <- safe_fit(Detection ~ Group + Location +
+    (1 | Taxon) + (1 | PlotID) + (1 | SampleID))
+  if (is_valid(no_height)) {
+    height_lrt <- as.data.frame(anova(no_height, additive))
+    height_test <- data.frame(
+      Analysis = analysis_name, Scope = scope, Trait = trait_name,
+      Test = "Height effect under additive model (no interaction)",
+      Chi_square = height_lrt$Chisq[2],
+      Df = height_lrt$`Chi Df`[2],
+      P = height_lrt$`Pr(>Chisq)`[2]
+    )
+    omnibus_tables[[paste0(analysis_name, "_height")]] <- height_test
+    write.csv(height_test,
+      file.path(output_dir, paste0(analysis_name, "_height_effect_additive_LRT.csv")),
+      row.names = FALSE)
+  }
+  saveRDS(no_height, file.path(output_dir, paste0(analysis_name, "_no_height_model.rds")))
+
+  # EMMs are model-based and averaged equally across Location levels.
+  # Keep pairwise contrasts on the LINK scale for correct tests.
+  em_height <- emmeans(full, ~ Height | Group, weights = "equal")
+  em_group <- emmeans(full, ~ Group | Height, weights = "equal")
+
+  height_pairs <- as.data.frame(summary(pairs(em_height, adjust = "holm"),
+                                        infer = c(TRUE, TRUE)))
+  group_pairs <- as.data.frame(summary(pairs(em_group, adjust = "holm"),
+                                       infer = c(TRUE, TRUE)))
+  height_pairs$Analysis <- analysis_name
+  height_pairs$Scope <- scope
+  height_pairs$Trait <- trait_name
+  group_pairs$Analysis <- analysis_name
+  group_pairs$Scope <- scope
+  group_pairs$Trait <- trait_name
+  pairwise_height_tables[[analysis_name]] <- height_pairs
+  pairwise_group_tables[[analysis_name]] <- group_pairs
+  write.csv(height_pairs, file.path(output_dir,
+            paste0(analysis_name, "_WHICH_HEIGHTS_Holm.csv")), row.names = FALSE)
+  write.csv(group_pairs, file.path(output_dir,
+            paste0(analysis_name, "_WHICH_GROUPS_WITHIN_HEIGHT_Holm.csv")), row.names = FALSE)
+  # Note: Holm adjustments are made separately within each conditioning
+  # group by emmeans. Additional global adjustment across all groups can be
+  # requested when treating the entire set as one multiplicity family.
+
+  # Response-scale predictions (population-level; random effects set to zero).
+  predicted <- as.data.frame(summary(emmeans(full, ~ Height * Group,
+                                              weights = "equal"), type = "response"))
+  write.csv(predicted, file.path(output_dir,
+            paste0(analysis_name, "_predicted_detection_probability.csv")), row.names = FALSE)
+
+  probability_col <- intersect(c("prob", "response", "rate"), names(predicted))[1]
+  lower_col <- intersect(c("asymp.LCL", "lower.CL"), names(predicted))[1]
+  upper_col <- intersect(c("asymp.UCL", "upper.CL"), names(predicted))[1]
+  if (anyNA(c(probability_col, lower_col, upper_col))) {
+    warning(trait_name, ": unknown emmeans column names: ", paste(names(predicted), collapse = ", "))
+    next
+  }
+  predicted <- predicted %>% mutate(
+    Probability = .data[[probability_col]],
+    LCL = .data[[lower_col]],
+    UCL = .data[[upper_col]],
+    Group = factor(Group, levels = levels(dat$Group)),
+    Height = factor(Height, levels = height_levels)
+  )
+
+  # ========================================================================
+  # 11. PANEL A: TAXON-LEVEL OBSERVED DETECTION FREQUENCY HEATMAP
+  # ========================================================================
+  # Each heatmap cell = 100 * positive swabs / total swabs at that height.
+  # 96 swabs per height in the complete design.
+  heat <- dat %>% group_by(Taxon, Group, Height) %>% summarise(
+    Positive_swabs = sum(Detection),
+    Total_swabs = n(),
+    Detection_percent = 100 * Positive_swabs / Total_swabs,
+    .groups = "drop"
+  )
+  write.csv(heat, file.path(output_dir,
+            paste0(analysis_name, "_taxon_detection_heatmap_data.csv")), row.names = FALSE)
+
+  # Order taxa by trait category, then descending total detection frequency.
+  order_taxa <- heat %>% group_by(Group, Taxon) %>% summarise(
+    Overall = sum(Positive_swabs), .groups = "drop"
+  ) %>% arrange(Group, desc(Overall), Taxon) %>% pull(Taxon) %>% as.character()
+  heat <- heat %>% mutate(
+    Taxon = factor(as.character(Taxon), levels = rev(unique(order_taxa))),
+    Height = factor(Height, levels = height_levels)
+  )
+
+  p_heat <- ggplot(heat, aes(x = Height, y = Taxon, fill = Detection_percent)) +
+    geom_tile(colour = "white", linewidth = 0.18) +
+    geom_text(aes(label = sprintf("%.1f", Detection_percent)), size = 2.1) +
+    facet_grid(Group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    scale_fill_gradient(low = "#F6FAFE", high = "#1764A4", limits = c(0, 100),
+                        name = "Detection\nfrequency (%)") +
+    scale_x_discrete(position = "top") +
+    labs(title = paste0("A. ", gsub("_", " ", analysis_name), ": observed detection frequency"),
+         x = "Leaf-swab sampling height", y = "Taxon") +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", size = 13),
+          strip.text.y.left = element_text(face = "bold", angle = 90),
+          axis.text.y = element_text(size = 7, face = "italic"),
+          axis.text.x = element_text(size = 11),
+          legend.position = "bottom")
+
+  # ========================================================================
+  # 12. PANEL B: GLMM ESTIMATED PROBABILITY AND 95% CI
+  # ========================================================================
+  p_prob <- ggplot(predicted, aes(x = Height, y = Probability,
+                                  colour = Group, group = Group)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.7) +
+    geom_errorbar(aes(ymin = LCL, ymax = UCL), width = 0.10,
+                  linewidth = 0.65) +
+    scale_colour_manual(values = palette, drop = FALSE) +
+    scale_y_continuous(labels = function(x) paste0(round(x * 100, 1), "%"),
+                       expand = expansion(mult = c(0.03, 0.08))) +
+    labs(title = paste0("B. ", gsub("_", " ", analysis_name), ": GLMM detection probability"),
+         x = "Leaf-swab sampling height", y = "Estimated eDNA detection probability",
+         colour = "Trait category") +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", size = 13),
+          legend.position = "right")
+
+  # Note: global interaction P-value is NOT a test of any specific pair.
+  # Individual pairwise height P-values are in *_WHICH_HEIGHTS_Holm.csv.
+  pval <- interaction_tables[[analysis_name]]$P
+  p_prob <- p_prob + annotate("text", x = 2, y = Inf,
+                               label = paste0("Height x trait LRT: P = ",
+                                              format.pval(pval, digits = 3)),
+                               vjust = 1.6, size = 3.8)
+
+  # Dynamic figure height keeps heatmap taxon labels legible.
+  n_taxa <- n_distinct(heat$Taxon)
+  fig_height <- max(8, min(25, 3.5 + 0.20 * n_taxa))
+  figure <- cowplot::plot_grid(p_heat, p_prob, nrow = 1,
+                               rel_widths = c(1.5, 1.0), align = "none")
+  ggsave(file.path(output_dir, paste0(analysis_name, "_Heatmap_GLMM_600dpi.png")),
+         figure, width = 17, height = fig_height, units = "in", dpi = 600,
+         limitsize = FALSE, bg = "white")
+  ggsave(file.path(output_dir, paste0(analysis_name, "_Heatmap_GLMM_vector.pdf")),
+         figure, width = 17, height = fig_height, units = "in",
+         device = grDevices::cairo_pdf, limitsize = FALSE, bg = "white")
+  ggsave(file.path(output_dir, paste0(analysis_name, "_GLMM_only_600dpi.png")),
+         p_prob, width = 9, height = 6, units = "in", dpi = 600, bg = "white")
+
+  # DHARMa: use bootstrap outlier test for binary responses.
+  if (requireNamespace("DHARMa", quietly = TRUE)) {
+    set.seed(123)
+    sim <- tryCatch(DHARMa::simulateResiduals(full, n = 500, plot = FALSE),
+                    error = function(e) { warning(conditionMessage(e)); NULL })
+    if (!is.null(sim)) {
+      pdf(file.path(output_dir, paste0(analysis_name, "_DHARMa.pdf")), width = 9, height = 7)
+      tryCatch(plot(sim), finally = dev.off())
+      uni <- DHARMa::testUniformity(sim, plot = FALSE)
+      disp <- DHARMa::testDispersion(sim, plot = FALSE)
+      zero <- DHARMa::testZeroInflation(sim, plot = FALSE)
+      out <- tryCatch(DHARMa::testOutliers(sim, type = "bootstrap", plot = FALSE),
+                      error = function(e) { warning(conditionMessage(e)); NULL })
+      diag_row <- data.frame(Analysis = analysis_name, Scope = scope, Trait = trait_name,
+        Uniformity_P = uni$p.value, Dispersion_P = disp$p.value,
+        Zero_inflation_P = zero$p.value,
+        Outlier_bootstrap_P = if (is.null(out)) NA_real_ else out$p.value)
+      diagnostic_tables[[analysis_name]] <- diag_row
+      capture.output({
+        print(uni); print(disp); print(zero)
+        if (!is.null(out)) print(out)
+      }, file = file.path(output_dir, paste0(analysis_name, "_DHARMa_tests.txt")))
+    }
+  }
+  results[[analysis_name]] <- TRUE
+}
+
+# ============================================================================
+# 13. EXPORT CROSS-TRAIT SUMMARY
+# ============================================================================
+if (length(interaction_tables)) {
+  write.csv(dplyr::bind_rows(interaction_tables),
+            file.path(output_dir, "NINE_ANALYSES_height_interaction_LRT.csv"),
+            row.names = FALSE)
+}
+if (length(status_tables)) {
+  write.csv(dplyr::bind_rows(status_tables),
+            file.path(output_dir, "NINE_ANALYSES_model_convergence.csv"),
+            row.names = FALSE)
+}
+if (length(omnibus_tables)) {
+  write.csv(bind_rows(omnibus_tables),
+    file.path(output_dir, "NINE_ANALYSES_additive_main_effect_LRT.csv"), row.names = FALSE)
+}
+if (length(pairwise_height_tables)) {
+  all_height <- bind_rows(pairwise_height_tables)
+  if ("p.value" %in% names(all_height)) {
+    all_height$P_Holm_across_analysis <- ave(all_height$p.value, all_height$Analysis,
+      FUN = function(p) p.adjust(p, method = "holm"))
+  }
+  write.csv(all_height, file.path(output_dir, "NINE_ANALYSES_height_posthoc.csv"),
+    row.names = FALSE)
+}
+if (length(pairwise_group_tables)) {
+  all_group <- bind_rows(pairwise_group_tables)
+  if ("p.value" %in% names(all_group)) {
+    all_group$P_Holm_across_analysis <- ave(all_group$p.value, all_group$Analysis,
+      FUN = function(p) p.adjust(p, method = "holm"))
+  }
+  write.csv(all_group, file.path(output_dir, "NINE_ANALYSES_group_posthoc.csv"),
+    row.names = FALSE)
+}
+if (length(diagnostic_tables)) {
+  write.csv(bind_rows(diagnostic_tables),
+    file.path(output_dir, "NINE_ANALYSES_DHARMa_test_summary.csv"), row.names = FALSE)
+}
+cat("\nFINISHED. Analysed: ", paste(names(results), collapse = ", "),
+    "\nResults in: ", normalizePath(output_dir), "\n", sep = "")
+cat("Check convergence and DHARMa before interpreting any P-values.\n")
 
