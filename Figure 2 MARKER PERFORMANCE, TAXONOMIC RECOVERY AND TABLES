@@ -1,0 +1,535 @@
+# =============================================================================
+# FIGURE 2 | MARKER PERFORMANCE, TAXONOMIC RECOVERY AND MANUSCRIPT TABLES
+# =============================================================================
+# PURPOSE: Reproduce panels A-D and export the exact counts and taxon lists
+# OUTPUTS: figures2/*.png, Reads_Taxonomic_Recovery_and_IUCN.xlsx
+# =============================================================================
+
+# 1. PACKAGES AND FILES -------------------------------------------------------
+library(tidyverse)  # Data cleaning, string processing and ggplot2
+library(readxl)     # Read the Excel OTU sheets
+library(gghalves)   # Half-violin distribution in Panel C
+library(patchwork)  # Arrange the four plots
+library(scales)     # Axis and console number formatting
+library(writexl)    # Export multi-sheet Excel workbooks
+
+# Set this path for your local computer; change when cloning from GitHub.
+setwd("C:/Users/Fajrin/Desktop/Analysis_manuscript/")
+dir.create("figures2", showWarnings = FALSE, recursive = TRUE)
+
+# Read the original OTU data ONCE; later objects are filtered copies.
+otu_12S_raw <- read_excel("Supplementary Table.xlsx", sheet = "S1 - 12S OTU")
+otu_16S_raw <- read_excel("Supplementary Table.xlsx", sheet = "S2 - 16S OTU")
+reads_df <- read_delim("Reads_Metadata.csv", delim = ";", trim_ws = TRUE,
+                       col_types = cols(.default = col_character()),
+                       show_col_types = FALSE)
+names(reads_df) <- trimws(names(reads_df))
+required_reads <- c("sample_ID", "total_reads", "12S_reads", "12S_reads_%",
+                    "16S_reads", "16S_reads_%", "unassign_reads", "unassign_reads_%")
+
+# 2. CONSISTENT FIGURE COLOURS AND THEME --------------------------------------
+marker_colours <- c(
+  "12S"        = "#4878A8",  # Muted blue: mitochondrial 12S reads
+  "16S"        = "#C47A43",  # Muted orange: mitochondrial 16S reads
+  "Combined"   = "#8064A2",  # Purple: combined-marker category (later panels)
+  "Unassigned" = "#A9ADB2"   # Grey: reads not assigned to either marker
+)
+
+
+otu_colours <- c(
+  "Retained_OTUs"     = "#6B9187",  # OTUs retained after filtering
+  "Control"           = "#96B8D0",  # Control-associated OTUs
+  "No_Borneo_Record"  = "#C3A36B",  # Taxa without a Borneo record
+  "No_BLAST_Hits"     = "#B3B3B3",  # Sequences with no BLAST matches
+  "Above_Genus_Level" = "#7C838C",  # Identifiable only above genus rank
+  "NUMTs"             = "#8B7BA3",  # Nuclear mitochondrial sequences
+  "Human"             = "#D5A7A1",  # Human-associated sequences
+  "Domestic_Animal"   = "#A8BA9B"   # Domestic-animal sequences
+)
+
+# Start with ggplot2's classic theme at a base font size of 16 points.
+publication_theme <- theme_classic(base_size = 16) +
+  theme(
+    # Make axis titles larger, bold, and black.
+    axis.title = element_text(size = 18, face = "bold", colour = "black"),
+
+    # Make tick labels readable in publication-sized figures.
+    axis.text = element_text(size = 15, colour = "black"),
+
+    # Control the colour and thickness of the horizontal/vertical axes.
+    axis.line = element_line(colour = "black", linewidth = 0.6),
+
+    # Control tick-mark appearance and length.
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm"),
+
+    # Style legend headings, legend category labels, and legend swatches.
+    legend.title = element_text(size = 15, face = "bold"),
+    legend.text = element_text(size = 14, colour = "black"),
+    legend.key.size = unit(0.75, "cm"),
+
+    # Add whitespace around each plot (top, right, bottom, left).
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+# 3. TAXONOMY AND FILTERING HELPERS -------------------------------------------
+# Return first nonempty entry; unlike first(na.omit(x)), this handles all-NA.
+first_available <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A")] <- NA_character_
+  values <- x[!is.na(x)]
+  if (length(values)) values[1] else NA_character_
+}
+
+filter_categories <- c("Control", "No_Borneo_Record", "No_BLAST_Hits",
+                       "Above_Genus_Level", "NUMTs", "Human", "Domestic_Animal")
+
+# Match exclusion labels; each OTU must have at most one exclusion reason
+exclusion_matches <- function(df) {
+  map_dfc(filter_categories, function(cat) {
+    tibble(!!cat := str_detect(coalesce(df$Note, ""),
+                               regex(cat, ignore_case = TRUE)))
+  })
+}
+
+# Remove excluded OTUs and control sample columns, without altering input files.
+filter_retained_otus <- function(df) {
+  excluded <- rowSums(exclusion_matches(df)) > 0
+  control_cols <- names(df)[str_detect(names(df), "^Control_")]
+  df[!excluded, , drop = FALSE] %>% select(-any_of(control_cols))
+}
+
+# Derive one Taxon label per OTU: species if available, otherwise Genus_sp.
+# Preserve genus-level detections rather than treating them as species.
+clean_taxonomy <- function(df) {
+  df %>% mutate(across(c(Class, Order, Family, Genus, Species, IUCN),
+                       ~ na_if(trimws(as.character(.x)), "")),
+                across(c(Class, Order, Family, Genus, Species, IUCN),
+                       ~ na_if(.x, "NA")),
+                Taxon = case_when(!is.na(Species) ~ Species,
+                                  !is.na(Genus) ~ paste0(Genus, "_sp."),
+                                  TRUE ~ NA_character_))
+}
+
+# Collapse duplicate OTU identifications within each marker. Only taxonomic
+# metadata are retained: no indiscriminate summing of numeric metadata.
+collapse_by_taxon <- function(df, marker_name) {
+  df %>% filter(!is.na(Taxon)) %>% group_by(Taxon) %>%
+    summarise(across(c(Class, Order, Family, Genus, Species, IUCN), first_available),
+              Marker = marker_name,
+              N_OTUs = n(),
+              .groups = "drop")
+}
+
+# 4. PANEL A | READ PROPORTIONS ------------------------------------------------
+# Convert read counts and percentages from text to numeric values.
+reads_df <- reads_df %>%
+  mutate(
+    across(
+      c(
+        total_reads,
+        `12S_reads`, `12S_reads_%`,
+        `16S_reads`, `16S_reads_%`,
+        unassign_reads, `unassign_reads_%`
+      ),
+      # Convert '-' to missing, then extract the numeric part of each value.
+      # NOTE: parse_number() uses locale rules; check separator conventions.
+      ~ parse_number(na_if(.x, "-"))
+    )
+  )
+
+# Sum the total sequencing reads across all samples.
+total_reads <- sum(reads_df$total_reads, na.rm = TRUE)
+
+# Sum reads assigned to the 12S marker.
+total_12S_reads <- sum(reads_df$`12S_reads`, na.rm = TRUE)
+
+# Sum reads assigned to the 16S marker.
+total_16S_reads <- sum(reads_df$`16S_reads`, na.rm = TRUE)
+
+# Sum reads not assigned to either marker.
+total_unassigned_reads <- sum(reads_df$unassign_reads, na.rm = TRUE)
+
+# Create a four-row table with read totals and percentages of all reads.
+read_summary <- tibble(
+  Category = c(
+    "Total reads", "12S reads", "16S reads", "Unassigned reads"
+  ),
+  Reads = c(
+    total_reads, total_12S_reads, total_16S_reads, total_unassigned_reads
+  ),
+  Percentage = c(
+    100,
+    (total_12S_reads / total_reads) * 100,
+    (total_16S_reads / total_reads) * 100,
+    (total_unassigned_reads / total_reads) * 100
+  )
+)
+
+# Prepare a human-readable copy for console display only.
+read_summary_display <- read_summary %>%
+  mutate(
+    # Add thousands separators while retaining two-decimal formatting.
+    Reads = comma(Reads, accuracy = 2),
+
+    # Format percentages with two decimals and a percent symbol.
+    Percentage = paste0(number(Percentage, accuracy = 0.01), "%")
+  )
+
+# Show the formatted sequencing summary in the R console.
+print(read_summary_display)
+
+# Arrange sample IDs from highest to lowest percentage of 12S reads.
+# This ordering determines the left-to-right position of samples in Panel A.
+sample_order <- reads_df %>%
+  arrange(desc(`12S_reads_%`)) %>%
+  pull(sample_ID)
+
+# Reshape from wide format (one column per marker) to long format
+# (one row per sample-marker combination), as required by ggplot2.
+reads_long <- reads_df %>%
+  # Keep only the sample identifier and the three percentage columns.
+  select(sample_ID, `12S_reads_%`, `16S_reads_%`, `unassign_reads_%`) %>%
+
+  # Gather the three marker columns into Category and Proportion columns.
+  pivot_longer(
+    cols = -sample_ID,
+    names_to = "Category",
+    values_to = "Proportion"
+  ) %>%
+  mutate(
+    # Replace original CSV column names with concise legend labels.
+    Category = recode(
+      Category,
+      `12S_reads_%` = "12S",
+      `16S_reads_%` = "16S",
+      `unassign_reads_%` = "Unassigned"
+    ),
+
+    # Fix the stacking and legend order of marker categories.
+    Category = factor(Category, levels = c("12S", "16S", "Unassigned")),
+
+    # Preserve the previously calculated left-to-right sample order.
+    sample_ID = factor(sample_ID, levels = sample_order)
+  )
+
+# Build Panel 2A as a stacked bar chart of marker proportions per sample.
+Panel_2A <- ggplot(
+  reads_long,
+  aes(x = sample_ID, y = Proportion, fill = Category)
+) +
+  geom_col(position = "fill", na.rm = TRUE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.25),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  labs(x = NULL, y = "Read proportion", fill = NULL) +
+  publication_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "top",
+    legend.direction = "horizontal"
+  )
+
+Panel_2A
+
+ggsave("figures2/Figure2A_Read_Proportions.png", Panel_2A,
+        width = 10, height = 7, dpi = 600)
+
+# 5. PANEL B | OTU FILTERING --------------------------------------------------
+# Count each mutually exclusive exclusion reason for each marker.
+count_filter_categories <- function(df, marker_name) {
+  matches <- exclusion_matches(df)
+  tibble(Marker = marker_name, Category = filter_categories,
+         Count = as.integer(colSums(matches)))
+}
+removed_df <- bind_rows(count_filter_categories(otu_12S_raw, "12S"),
+                        count_filter_categories(otu_16S_raw, "16S"))
+retained_df <- tibble(Marker = c("12S", "16S"),
+                      Category = "Retained_OTUs",
+                      Count = c(nrow(filter_retained_otus(otu_12S_raw)),
+                                nrow(filter_retained_otus(otu_16S_raw))))
+plot_b_df <- bind_rows(retained_df, removed_df) %>%
+  mutate(Marker = factor(Marker, levels = c("12S", "16S")),
+         Category = factor(Category, levels = c(
+           "Domestic_Animal", "Human", "NUMTs", "Above_Genus_Level",
+           "No_BLAST_Hits", "No_Borneo_Record", "Control", "Retained_OTUs")))
+
+# Construct stacked OTU-count bars for the two markers.
+Panel_2B <- ggplot(
+  plot_b_df,
+  aes(x = Marker, y = Count, fill = Category)
+) +
+  geom_col(
+    colour = "black",
+    linewidth = 0.3,
+    width = 0.68
+  ) +
+  geom_text(
+    data = plot_b_df %>% filter(Category == "Retained_OTUs"),
+    aes(label = Count),
+    position = position_stack(vjust = 0.5),
+    size = 4.2,
+    fontface = "bold",
+    colour = "white"
+  ) +
+  scale_fill_manual(
+    values = otu_colours,
+    breaks = c(
+      "Retained_OTUs", "Control", "No_Borneo_Record", "No_BLAST_Hits",
+      "Above_Genus_Level", "NUMTs", "Human", "Domestic_Animal"
+    ),
+    labels = c(
+      "Retained OTUs", "Controls", "No Borneo record",
+      "No BLAST hits", "Above genus level", "NUMTs",
+      "Human", "Domestic animals"
+    ),
+    drop = FALSE
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.04))) +
+  labs(x = "Marker", y = "Number of OTUs", fill = NULL) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 16, face = "bold")
+  )
+
+Panel_2B
+
+ggsave("figures2/Figure2B_OTU_Summary.png", Panel_2B,
+       width = 10, height = 7, dpi = 600)
+
+# 6. FILTER RETAINED OTUS -----------------------------------------------------
+otu_12S_retained <- filter_retained_otus(otu_12S_raw)
+otu_16S_retained <- filter_retained_otus(otu_16S_raw)
+
+# 7. PANEL C | BLAST PERCENT IDENTITY -----------------------------------------
+# Select the marker name and percent-identity value from each retained table.
+# transmute() discards other columns; bind_rows() stacks the marker datasets.
+# as.numeric() converts percent identity to a number for the y-axis.
+percent_identity_df <- bind_rows(
+  otu_12S_retained %>%
+    transmute(Marker = "12S", Perc_ID = as.numeric(Perc_ID)),
+  otu_16S_retained %>%
+    transmute(Marker = "16S", Perc_ID = as.numeric(Perc_ID))
+) %>%
+  # Exclude missing identity values and fix the marker display order.
+  filter(!is.na(Perc_ID)) %>%
+  mutate(Marker = factor(Marker, levels = c("12S", "16S")))
+
+# Assemble a raincloud-style distribution plot.
+Panel_2C <- ggplot(
+  percent_identity_df,
+  aes(x = Marker, y = Perc_ID, fill = Marker)
+) +
+  geom_half_violin(
+    side = "r",
+    trim = FALSE,
+    colour = NA,
+    width = 1,
+    nudge = 0.22
+  ) +
+  geom_boxplot(
+    width = 0.20,
+    outlier.shape = NA,
+    fill = "white",
+    colour = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(colour = Marker),
+    position = position_jitter(width = 0.18, height = 0),
+    alpha = 0.35,
+    size = 2.8
+  ) +
+  coord_flip(ylim = c(95, 100), clip = "off") +
+  scale_y_continuous(
+    limits = c(95, 100),
+    breaks = seq(95, 100, 1),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  scale_colour_manual(values = marker_colours) +
+  labs(x = "Marker", y = "Percent identity (%)") +
+  publication_theme +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 16, face = "bold")
+  )
+
+Panel_2C
+
+ggsave("figures2/Figure2C_Percent_Identity.png", Panel_2C,
+       width = 10, height = 7, dpi = 600)
+
+# 8. PANEL D | TAXONOMIC RECOVERY ---------------------------------------------
+# Collapse within markers, then across markers, retaining IUCN and provenance.
+otu_12S_collapse <- collapse_by_taxon(clean_taxonomy(otu_12S_retained), "12S")
+otu_16S_collapse <- collapse_by_taxon(clean_taxonomy(otu_16S_retained), "16S")
+
+# One row per distinct Taxon, with marker(s) in which it was detected.
+otu_combined <- bind_rows(otu_12S_collapse, otu_16S_collapse) %>%
+  group_by(Taxon) %>%
+  summarise(across(c(Class, Order, Family, Genus, Species, IUCN), first_available),
+            Marker = paste(sort(unique(Marker)), collapse = "+"),
+            IUCN_conflict = n_distinct(na.omit(IUCN)) > 1,
+            .groups = "drop")
+
+# Counts used in Figure 2D. n_distinct excludes missing assignments.
+summarise_taxonomic_ranks <- function(df, marker_name) {
+  tibble(Marker = marker_name,
+         Taxon = n_distinct(df$Taxon, na.rm = TRUE),
+         Species = n_distinct(df$Species, na.rm = TRUE),
+         Genus = n_distinct(df$Genus, na.rm = TRUE),
+         Family = n_distinct(df$Family, na.rm = TRUE),
+         Order = n_distinct(df$Order, na.rm = TRUE),
+         Class = n_distinct(df$Class, na.rm = TRUE))
+}
+marker_summary <- bind_rows(
+  summarise_taxonomic_ranks(otu_12S_collapse, "12S"),
+  summarise_taxonomic_ranks(otu_16S_collapse, "16S"),
+  summarise_taxonomic_ranks(otu_combined, "Combined"))
+marker_long <- marker_summary %>%
+  pivot_longer(
+    cols = c(Taxon, Species, Genus, Family, Order, Class),
+    names_to = "Rank",
+    values_to = "Count"
+  ) %>%
+  mutate(
+    Rank = factor(
+      Rank,
+      levels = c("Taxon", "Species", "Genus",
+                 "Family", "Order", "Class"),
+      labels = c("Total taxa", "Species", "Genera",
+                 "Families", "Orders", "Classes")
+    ),
+    Marker = factor(
+      Marker,
+      levels = c("12S", "16S", "Combined")
+    )
+  )
+
+# Draw grouped bars comparing taxonomic recovery across the three datasets.
+Panel_2D <- ggplot(
+  marker_long,
+  aes(x = Rank, y = Count, fill = Marker)
+) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65,
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(label = Count),
+    position = position_dodge(width = 0.75),
+    vjust = -0.35,
+    size = 5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = marker_colours) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Taxonomic rank", y = "Number of taxa", fill = NULL) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 14, face = "bold")
+  )
+
+Panel_2D
+
+ggsave("figures2/Figure2D_Taxonomic_Richness.png", Panel_2D,
+       width = 10, height = 7, dpi = 600)
+
+# 9. MANUSCRIPT TABLES | COMBINED TAXONOMIC RECOVERY ---------------------------
+
+taxonomic_totals <- marker_summary %>%
+  filter(Marker == "Combined") %>%
+  select(Taxa = Taxon, Species, Genera = Genus, Families = Family,
+         Orders = Order, Classes = Class)
+
+# Include all observed vertebrate classes, including those with zero species.
+class_summary <- otu_combined %>%
+  group_by(Class) %>%
+  summarise(Taxa = n_distinct(Taxon),
+            Species = n_distinct(Species, na.rm = TRUE),
+            Genus_only_taxa = n_distinct(Taxon[is.na(Species)]),
+            .groups = "drop") %>%
+  arrange(desc(Species), Class)
+
+# Complete list of species-level identifications by vertebrate class.
+species_by_class <- otu_combined %>%
+  filter(!is.na(Species)) %>%
+  select(Class, Order, Family, Genus, Species, Taxon, Marker, IUCN) %>%
+  arrange(Class, Species)
+
+# Genus-level records; useful for confirming reptile Lipinia_sp. status.
+genus_only_taxa <- otu_combined %>%
+  filter(is.na(Species)) %>%
+  select(Class, Order, Family, Genus, Taxon, Marker) %>%
+  arrange(Class, Taxon)
+
+# 10. IUCN TABLES | COUNTS AND ANIMAL NAMES -----------------------------------
+# IUCN status is species-specific; restrict these counts to species-level taxa.
+iucn_levels <- c("CR", "EN", "VU", "NT", "LC", "DD", "NE", "EX", "EW", "NA")
+iucn_species <- species_by_class %>%
+  mutate(IUCN = toupper(trimws(as.character(IUCN))),
+         IUCN = if_else(is.na(IUCN) | IUCN == "", "NA", IUCN)) %>%
+  arrange(match(IUCN, iucn_levels), Class, Species)
+
+# Count species by conservation status, without percentages.
+iucn_summary <- iucn_species %>%
+  count(IUCN, name = "Number_of_species") %>%
+  arrange(match(IUCN, iucn_levels))
+
+# Each status has its own list; DD is included separately, not 'threatened'.
+iucn_species_list <- iucn_species %>%
+  select(IUCN, Species, Class, Order, Family, Marker) %>%
+  arrange(match(IUCN, iucn_levels), Species)
+threatened_species <- iucn_species_list %>% filter(IUCN %in% c("CR", "EN", "VU"))
+
+# Print the values needed to verify the manuscript narrative.
+cat("\nREAD SUMMARY\n"); print(read_summary_display)
+cat("\nCOMBINED TAXONOMIC TOTALS\n"); print(taxonomic_totals)
+cat("\nSPECIES PER CLASS\n"); print(class_summary)
+cat("\nGENUS-ONLY DETECTIONS\n"); print(genus_only_taxa, n = Inf)
+cat("\nIUCN COUNTS (SPECIES ONLY)\n"); print(iucn_summary)
+
+# 11. EXPORT ONE EXCEL WORKBOOK ------------------------------------------------
+# The sheets provide both numerical summaries and underlying animal names.
+write_xlsx(list(
+  "Overall_Read_Summary" = read_summary,
+  "Taxonomic_Totals" = taxonomic_totals,
+  "Species_by_Class" = class_summary,
+  "Marker_Recovery" = marker_summary,
+  "Combined_Taxa" = otu_combined,
+  "Species_List" = species_by_class,
+  "Genus_Only_Taxa" = genus_only_taxa,
+  "IUCN_Summary" = iucn_summary,
+  "IUCN_Species_List" = iucn_species_list,
+  "Threatened_Species" = threatened_species,
+  "IUCN_Conflicts" = otu_combined %>% filter(IUCN_conflict)
+), path = "figures2/Reads_Taxonomic_Recovery_and_IUCN.xlsx")
+
+# 12. COMBINE PANELS A-D AND SAVE ---------------------------------------------
+# In patchwork, | places plots side by side and / stacks rows.
+# plot_layout() controls the relative panel widths and heights.
+combined_Panel_2 <- (Panel_2A | Panel_2B) / (Panel_2C | Panel_2D) +
+  plot_layout(
+    widths = c(1, 1),
+    heights = c(1, 1)
+  ) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 24, face = "bold", colour = "black")
+    )
+  )
+
+combined_Panel_2
+
+ggsave("figures2/Figure2_Marker_Performance_and_Taxonomic_Recovery.png",
+       combined_Panel_2, width = 16, height = 10, dpi = 600)
