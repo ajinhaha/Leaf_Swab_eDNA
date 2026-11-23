@@ -1,0 +1,800 @@
+# =============================================================================
+# FIGURE S2 | iNEXT RICHNESS AND OBSERVED TAXONOMIC OVERLAP
+# =============================================================================
+# A-C. Taxonomic richness by marker, vegetation height, and location.
+# D-F. Sample coverage by marker, vegetation height, and location.
+# G-I. Observed taxonomic overlap by marker, vegetation height, and location.
+# Each row follows the same order from left to right.
+
+# 1. PACKAGES AND SETTINGS --------------------------------------------------
+# Install these packages once if needed.
+# install.packages(c(
+#   "readxl", "dplyr", "tidyr", "ggplot2", "iNEXT",
+#   "ComplexUpset", "patchwork", "ggrepel", "scales"
+# ))
+
+# Load packages for importing data, running iNEXT, and drawing the figure.
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(iNEXT)
+library(ComplexUpset)
+library(patchwork)
+library(ggrepel)
+
+# Open the project folder in RStudio, or change this path.
+# A dot means the current working directory. Use getwd() to check it.
+data_dir <- "."
+input_file <- file.path(data_dir, "Supplementary Table.xlsx")
+output_dir <- file.path(data_dir, "figuresS2")
+
+# Check that the workbook is available before importing data.
+if (!file.exists(input_file)) {
+  stop("Cannot find the input workbook: ", input_file)
+}
+
+# Create the output folder if needed.
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(2026)
+# Set the number of bootstrap replicates for confidence intervals.
+n_boot <- 100L
+confidence_level <- 0.95
+n_knots <- 80L
+extrapolation_multiplier <- 2L  # Extrapolate to twice the observed sample count.
+
+marker_levels <- c('12S', '16S', 'Combined')
+height_levels <- c('Lower', 'Middle', 'Upper')
+height_labels <- c(
+  "Lower"  = "Lower (<1 m)",
+  "Middle" = "Middle (1.3–1.5 m)",
+  "Upper"  = "Upper (2–2.5 m)"
+)
+location_levels <- c('SWN', 'BBI', 'SBJ', 'KRB', 'SLP')
+
+marker_colours <- c('12S' = '#4878A8', '16S' = '#C47A43',
+                    'Combined' = '#8B7BA3', 'Both' = '#8B7BA3')
+height_colours <- c('Lower' = '#C94D83', 'Middle' = '#D69A20',
+                    'Upper' = '#168F7A')
+location_colours <- c('SWN' = '#748FB9', 'BBI' = '#159DA6',
+                      'SBJ' = '#77983C', 'KRB' = '#C64A58',
+                      'SLP' = '#9B7064')
+
+# 2. IMPORT AND VALIDATE WORKSHEETS -----------------------------------------
+otu_12S_raw <- readxl::read_excel(input_file, sheet = 'S1 - 12S OTU')
+otu_16S_raw <- readxl::read_excel(input_file, sheet = 'S2 - 16S OTU')
+
+# These labels include both the older and newer Figure 2 filtering vocabulary.
+excluded_notes <- c('Control', 'No_Borneo_Record', 'No_Taxa',
+                    'No_BLAST_Hits', 'Below_Genus', 'Above_Genus_Level',
+                    'NUMTs', 'Human', 'Domestic_Animal')
+excluded_pattern <- paste(excluded_notes, collapse = '|')
+
+# Only named biological leaf swabs are included; controls cannot match this.
+sample_pattern <- '^(SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_.+$'
+
+# 3. CURATE EACH MARKER ------------------------------------------------------
+prepare_marker <- function(raw_table, marker) {
+  df <- as.data.frame(raw_table, check.names = FALSE)
+  names(df) <- trimws(names(df))
+  if (anyDuplicated(names(df))) stop(marker, ': duplicate column names')
+  needed <- c('Genus', 'Species', 'Note')
+  if (!all(needed %in% names(df))) {
+    stop(marker, ': missing columns: ',
+         paste(setdiff(needed, names(df)), collapse = ', '))
+  }
+  sample_cols <- grep(sample_pattern, names(df), value = TRUE)
+  if (!length(sample_cols)) stop(marker, ': no valid biological sample columns')
+  
+  notes <- as.character(df$Note)
+  exclude <- grepl(excluded_pattern, notes, ignore.case = TRUE)
+  exclude[is.na(exclude)] <- FALSE
+  df <- df[!exclude, , drop = FALSE]
+  
+  genus <- trimws(as.character(df$Genus))
+  species <- trimws(as.character(df$Species))
+  genus[toupper(genus) %in% c('', 'NA', 'N/A', 'NULL')] <- NA_character_
+  species[toupper(species) %in% c('', 'NA', 'N/A', 'NULL')] <- NA_character_
+  df$Taxon <- ifelse(!is.na(species), species,
+                     ifelse(!is.na(genus), paste0(genus, '_sp.'), NA_character_))
+  df <- df[!is.na(df$Taxon), , drop = FALSE]
+  if (!nrow(df)) stop(marker, ': no retained taxonomic records')
+  
+  for (nm in sample_cols) {
+    original <- trimws(as.character(df[[nm]]))
+    numeric_values <- suppressWarnings(as.numeric(original))
+    invalid <- !is.na(original) & original != '' & is.na(numeric_values)
+    if (any(invalid)) stop(marker, ': nonnumeric counts in ', nm)
+    numeric_values[is.na(numeric_values)] <- 0
+    if (any(numeric_values < 0)) stop(marker, ': negative counts in ', nm)
+    df[[nm]] <- numeric_values
+  }
+  
+  # Multiple OTUs with the same final taxon are one biological taxon.
+  collapsed <- df %>%
+    dplyr::select(Taxon, dplyr::all_of(sample_cols)) %>%
+    dplyr::group_by(Taxon) %>%
+    dplyr::summarise(dplyr::across(dplyr::all_of(sample_cols), sum),
+                     .groups = 'drop')
+  matrix_out <- as.matrix(collapsed[, sample_cols, drop = FALSE])
+  storage.mode(matrix_out) <- 'numeric'
+  rownames(matrix_out) <- collapsed$Taxon
+  matrix_out <- (matrix_out > 0) * 1L
+  matrix_out
+}
+
+incidence_12S <- prepare_marker(otu_12S_raw, '12S')
+incidence_16S <- prepare_marker(otu_16S_raw, '16S')
+
+# 4. ALIGN SAMPLES AND COMBINE MARKERS --------------------------------------
+# Missing columns in one marker represent zero detections for that marker.
+# Warn rather than silently requiring identical column sets.
+all_samples <- sort(union(colnames(incidence_12S), colnames(incidence_16S)))
+
+align_incidence <- function(mat, taxa, samples) {
+  result <- matrix(0L, nrow = length(taxa), ncol = length(samples),
+                   dimnames = list(taxa, samples))
+  result[rownames(mat), colnames(mat)] <- mat
+  result
+}
+
+all_taxa <- sort(union(rownames(incidence_12S), rownames(incidence_16S)))
+
+incidence_12S <- align_incidence(incidence_12S, all_taxa, all_samples)
+
+incidence_16S <- align_incidence(incidence_16S, all_taxa, all_samples)
+
+incidence_combined <- (incidence_12S + incidence_16S > 0) * 1L
+
+# Parse location, height, and plot ID from biological sample names.
+pattern <- '^([^_]+)_(Lower|Middle|Upper)_(.+)$'
+
+metadata <- data.frame(
+  SampleID = all_samples,
+  Location = sub(pattern, '\\1', all_samples),
+  Height = sub(pattern, '\\2', all_samples),
+  Plot = sub(pattern, '\\3', all_samples),
+  stringsAsFactors = FALSE
+)
+
+metadata$PlotID <- paste(metadata$Location, metadata$Plot, sep = '_')
+
+# 5. BUILD THE THREE INCIDENCE-RAW DATA LISTS -------------------------------
+# iNEXT incidence_raw expects taxa x sampling units (columns).
+# Keep all biological sampling units, INCLUDING those with zero detections.
+# Removing zero-detection samples biases sample-effort and coverage estimates.
+marker_list <- list('12S' = incidence_12S,
+                    '16S' = incidence_16S,
+                    'Combined' = incidence_combined)
+
+height_list <- lapply(height_levels, function(h) {
+  ids <- metadata$SampleID[metadata$Height == h]
+  incidence_combined[, ids, drop = FALSE]
+})
+
+names(height_list) <- height_levels
+
+# Pool three vegetation heights within each plot by logical OR.
+# Each plot is ONE independent incidence sampling unit for locations.
+plot_ids <- unique(metadata$PlotID)
+
+plot_incidence <- vapply(plot_ids, function(id) {
+  swabs <- metadata$SampleID[metadata$PlotID == id]
+  as.integer(rowSums(incidence_combined[, swabs, drop = FALSE]) > 0)
+}, integer(nrow(incidence_combined)))
+
+if (is.null(dim(plot_incidence))) {
+  plot_incidence <- matrix(plot_incidence, ncol = 1L)
+}
+
+rownames(plot_incidence) <- all_taxa
+
+colnames(plot_incidence) <- plot_ids
+
+plot_location <- metadata$Location[match(plot_ids, metadata$PlotID)]
+
+location_list <- lapply(location_levels, function(loc) {
+  plot_incidence[, plot_ids[plot_location == loc], drop = FALSE]
+})
+
+names(location_list) <- location_levels
+
+# Keep height curves based on the same sampling unit: individual leaf swabs.
+height_list <- height_list[height_levels]
+
+# iNEXT cannot estimate an assemblage with no observed taxa; fail explicitly.
+validate_list <- function(x, title) {
+  for (nm in names(x)) {
+    if (ncol(x[[nm]]) == 0L || sum(x[[nm]]) == 0L) {
+      stop(title, ' / ', nm, ': no samples or no detected taxa')
+    }
+  }
+  invisible(TRUE)
+}
+validate_list(marker_list, 'Marker')
+validate_list(height_list, 'Height')
+validate_list(location_list, 'Location')
+
+# 6. RUN iNEXT FOR MARKER, HEIGHT, AND LOCATION -----------------------------
+# Fit incidence-based richness (q = 0) and sample coverage in one run.
+run_inext <- function(assemblages) {
+  # iNEXT takes one endpoint, based here on the largest assemblage.
+  sample_counts <- vapply(assemblages, ncol, integer(1))
+  endpoint <- extrapolation_multiplier * max(sample_counts)
+  
+  # Estimate curves and bootstrap confidence intervals.
+  iNEXT::iNEXT(
+    assemblages,
+    q = 0,
+    datatype = "incidence_raw",
+    endpoint = endpoint,
+    knots = n_knots,
+    se = TRUE,
+    conf = confidence_level,
+    nboot = n_boot
+  )
+}
+
+# Note: iNEXT's single endpoint is common across assemblages; the displayed
+# curve for any group may exceed 2x its own effort if group sizes differ.
+# For strict per-group 2x extrapolation, trim plotted curves below.
+marker_inext <- run_inext(marker_list)
+
+height_inext <- run_inext(height_list)
+
+location_inext <- run_inext(location_list)
+
+# 7. EXTRACT CURVES AND ENFORCE GROUP-SPECIFIC 2x EFFORT --------------------
+extract_curves <- function(result, input_list, group_levels, type = 1) {
+  # Type 1 gives richness; type 2 gives coverage. Both use effort on x.
+  curves <- as.data.frame(ggplot2::fortify(result, type = type))
+  
+  # Check for the effort, estimate, method and confidence-interval columns.
+  expected <- c("Assemblage", "x", "y", "Method", "y.lwr", "y.upr")
+  missing_columns <- setdiff(expected, names(curves))
+  if (length(missing_columns) > 0) {
+    stop("Missing iNEXT curve columns: ",
+         paste(missing_columns, collapse = ", "))
+  }
+  
+  # Match each estimate to the maximum effort for its own assemblage.
+  group_name <- as.character(curves$Assemblage)
+  sample_counts <- vapply(input_list, ncol, integer(1))
+  max_effort <- extrapolation_multiplier * sample_counts
+  keep <- curves$x <= unname(max_effort[group_name])
+  
+  # Keep only estimates up to the effort limit.
+  curves$Assemblage <- factor(group_name, levels = group_levels)
+  curves$Method <- as.character(curves$Method)
+  curves[keep, , drop = FALSE]
+}
+
+marker_curves <- extract_curves(marker_inext, marker_list, marker_levels)
+
+height_curves <- extract_curves(height_inext, height_list, height_levels)
+
+location_curves <- extract_curves(location_inext, location_list, location_levels)
+
+# 8. PUBLICATION THEME AND iNEXT PANEL FUNCTION ----------------------------
+publication_theme <- ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(
+    axis.title = ggplot2::element_text(size = 13, face = 'bold', colour = 'black'),
+    axis.text = ggplot2::element_text(size = 11, colour = 'black'),
+    axis.line = ggplot2::element_line(linewidth = 0.45),
+    legend.position = 'none',
+    plot.title = ggplot2::element_text(face = 'bold', size = 14),
+    plot.margin = ggplot2::margin(8, 15, 8, 8)
+  )
+
+# Place group names at the right end of each extrapolation curve.
+# Labels use the same colour as their corresponding curve.
+make_inext_panel <- function(curves, colours, title, x_label,
+                             labels = NULL, coverage = FALSE) {
+  # Split line estimates from the observed-effort points.
+  line_rows <- curves$Method %in% c("Rarefaction", "Extrapolation")
+  lines <- curves[line_rows, , drop = FALSE]
+  observed <- curves[curves$Method == 'Observed', , drop = FALSE]
+  
+  # Prefer the furthest extrapolated estimate; otherwise use the furthest point.
+  label_data <- lines %>%
+    dplyr::group_by(Assemblage) %>%
+    dplyr::arrange(
+      dplyr::desc(Method == "Extrapolation"),
+      dplyr::desc(x),
+      .by_group = TRUE
+    ) %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::ungroup()
+  if (!nrow(label_data)) stop('No iNEXT curve endpoints available for ', title)
+  label_data$DirectLabel <- as.character(label_data$Assemblage)
+  if (!is.null(labels)) {
+    matched <- unname(labels[label_data$DirectLabel])
+    label_data$DirectLabel[!is.na(matched)] <- matched[!is.na(matched)]
+  }
+  
+  x_max <- max(lines$x, na.rm = TRUE)
+  label_data$LabelX <- x_max * 1.04
+  
+  # Build a shared plot for richness and coverage.
+  y_label <- if (coverage) "Sample coverage" else "Taxonomic richness"
+  plot <- ggplot(lines, aes(x = x, y = y, colour = Assemblage)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = y.lwr, ymax = y.upr, fill = Assemblage,
+                   group = interaction(Assemblage, Method)),
+      alpha = 0.13, colour = NA, na.rm = TRUE) +
+    ggplot2::geom_line(ggplot2::aes(linetype = Method,
+                                    group = interaction(Assemblage, Method)),
+                       linewidth = 0.85, na.rm = TRUE) +
+    ggplot2::geom_point(data = observed, size = 2.3, show.legend = FALSE) +
+    ggrepel::geom_text_repel(
+      data = label_data,
+      ggplot2::aes(x = LabelX, y = y, label = DirectLabel, colour = Assemblage),
+      inherit.aes = FALSE, direction = 'y', hjust = 0, size = 3.4,
+      fontface = 'bold', min.segment.length = 0, segment.alpha = 0.5,
+      box.padding = 0.15, point.padding = 0.1, max.overlaps = Inf,
+      seed = 2026, show.legend = FALSE) +
+    ggplot2::scale_colour_manual(values = colours, drop = FALSE) +
+    ggplot2::scale_fill_manual(values = colours, guide = 'none') +
+    ggplot2::scale_linetype_manual(
+      values = c('Rarefaction' = 'solid', 'Extrapolation' = 'dashed')) +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0.02, 0.30))) +
+    ggplot2::labs(title = title, x = x_label, y = y_label) +
+    publication_theme
+  
+  # Display coverage estimates as percentages.
+  if (coverage) {
+    plot <- plot +
+      scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+      coord_cartesian(ylim = c(0, 1), clip = "off")
+  } else {
+    plot <- plot + coord_cartesian(clip = "off")
+  }
+  
+  plot
+}
+
+# Put the column headings on the richness row.
+# The coverage row below supplies the sampling-effort axis titles.
+panel_A <- make_inext_panel(
+  marker_curves, marker_colours, "Marker", x_label = NULL
+)
+panel_B <- make_inext_panel(
+  height_curves, height_colours, "Vegetation height",
+  x_label = NULL, labels = height_labels
+)
+panel_C <- make_inext_panel(
+  location_curves, location_colours, "Location", x_label = NULL
+)
+
+# Extract sample coverage from the same iNEXT fits.
+marker_coverage <- extract_curves(
+  marker_inext, marker_list, marker_levels, type = 2
+)
+height_coverage <- extract_curves(
+  height_inext, height_list, height_levels, type = 2
+)
+location_coverage <- extract_curves(
+  location_inext, location_list, location_levels, type = 2
+)
+
+# Keep sampling-effort axis titles on the coverage row.
+panel_D <- make_inext_panel(
+  marker_coverage, marker_colours, title = NULL,
+  x_label = "Number of leaf-swab samples", coverage = TRUE
+)
+panel_E <- make_inext_panel(
+  height_coverage, height_colours, title = NULL,
+  x_label = "Number of leaf-swab samples", labels = height_labels, coverage = TRUE
+)
+panel_F <- make_inext_panel(
+  location_coverage, location_colours, title = NULL,
+  x_label = "Number of plots", coverage = TRUE
+)
+
+# Choose the sampling effort and coverage ranges to enlarge.
+height_zoom <- c(80, 110)
+height_coverage_zoom <- c(0.85, 0.90)
+location_zoom <- c(8, 22)
+location_coverage_zoom <- c(0.73, 0.88)
+
+# Add a zoom window using the same estimates as in the main panel.
+add_coverage_inset <- function(panel, curves, colours, x_range, y_range) {
+  # Separate fitted curves from points at the observed sampling effort.
+  is_observed <- curves$Method == "Observed"
+  fitted <- curves[!is_observed, , drop = FALSE]
+  observed <- curves[is_observed, , drop = FALSE]
+  
+  # Draw a compact copy of the curves with a tighter view.
+  zoom <- ggplot(fitted, aes(x, y, colour = Assemblage)) +
+    geom_ribbon(
+      aes(ymin = y.lwr, ymax = y.upr, fill = Assemblage,
+          group = interaction(Assemblage, Method)),
+      alpha = 0.13, colour = NA, na.rm = TRUE
+    ) +
+    geom_line(
+      aes(linetype = Method, group = interaction(Assemblage, Method)),
+      linewidth = 0.55, na.rm = TRUE
+    ) +
+    geom_point(data = observed, size = 1.6) +
+    scale_colour_manual(values = colours) +
+    scale_fill_manual(values = colours) +
+    scale_linetype_manual(
+      values = c(Rarefaction = "solid", Extrapolation = "dashed")
+    ) +
+    scale_x_continuous(n.breaks = 4) +
+    scale_y_continuous(
+      labels = scales::label_percent(accuracy = 1), n.breaks = 4
+    ) +
+    coord_cartesian(xlim = x_range, ylim = y_range, expand = FALSE) +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 9) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(4, 4, 4, 4)
+    )
+  
+  # Outline the area enlarged in the inset.
+  panel <- panel + annotate(
+    "rect",
+    xmin = x_range[1], xmax = x_range[2],
+    ymin = y_range[1], ymax = y_range[2],
+    fill = NA, colour = "grey40", linetype = "dotted"
+  )
+  
+  # Place the inset below the curves in the lower-right of the panel.
+  panel + patchwork::inset_element(
+    zoom, left = 0.52, bottom = 0.06, right = 0.91, top = 0.54,
+    align_to = "panel"
+  )
+}
+
+# Reading key: solid = rarefaction; dashed = extrapolation;
+# shaded bands = 95% confidence intervals. Group labels appear on curves.
+# Panel B compares only the three heights using leaf swabs as sampling units.
+
+# 9. BUILD TAXON MEMBERSHIP TABLES FOR UPSET -------------------------------
+# An intersection contains taxa detected in exactly the indicated sets.
+# 'Combined' is excluded from marker UpSet because it is the union of 12S/16S,
+# not an independent third marker.
+make_membership <- function(x, levels) {
+  taxa <- sort(unique(unlist(lapply(x, rownames))))
+  out <- data.frame(Taxon = taxa, check.names = FALSE)
+  for (nm in levels) {
+    mat <- x[[nm]]
+    present_taxa <- rownames(mat)[rowSums(mat) > 0]
+    out[[nm]] <- taxa %in% present_taxa
+  }
+  out <- out[rowSums(out[, levels, drop = FALSE]) > 0, , drop = FALSE]
+  out
+}
+
+marker_membership <- make_membership(marker_list[c('12S', '16S')], c('12S', '16S'))
+
+height_membership <- make_membership(height_list[height_levels], height_levels)
+
+location_membership <- make_membership(location_list, location_levels)
+
+# 10. DRAW MARKER-COLOURED UPSET INTERSECTIONS -----------------------------
+# The upper bars in ALL UpSet panels are coloured by marker detection:
+# 12S = detected by 12S only anywhere in the dataset;
+# 16S = detected by 16S only anywhere in the dataset;
+# Combined = detected by BOTH markers somewhere in the dataset.
+# These are mutually exclusive taxon categories, not three independent sets.
+# A height/location intersection can contain taxa from all three categories.
+# Accordingly, its upper bar is stacked by marker category, and its TOTAL
+# height remains the number of taxa in that exact height/location intersection.
+# IMPORTANT: marker category is defined globally across all samples, not
+# separately within each height/location intersection.
+
+marker_detected_12S <- rowSums(incidence_12S) > 0
+
+marker_detected_16S <- rowSums(incidence_16S) > 0
+
+marker_category <- ifelse(
+  marker_detected_12S & marker_detected_16S, 'Both',
+  ifelse(marker_detected_12S, '12S', '16S')
+)
+
+names(marker_category) <- rownames(incidence_combined)
+
+add_marker_category <- function(membership) {
+  membership$Marker_category <- factor(
+    unname(marker_category[as.character(membership$Taxon)]),
+    levels = c('12S', '16S', 'Both')
+  )
+  if (anyNA(membership$Marker_category)) {
+    stop('UpSet membership includes taxa without a marker classification')
+  }
+  membership
+}
+
+marker_membership <- add_marker_category(marker_membership)
+
+height_membership <- add_marker_category(height_membership)
+
+location_membership <- add_marker_category(location_membership)
+
+# ================================================================
+# UPSET PANELS G-I: SHARED MARKER COLOURS AND SINGLE LEGEND
+# ================================================================
+
+# Use the same marker colours across all three UpSet panels.
+upset_marker_colours <- marker_colours[
+  c("12S", "16S", "Both")
+]
+
+# Create an UpSet plot with an optional marker legend.
+make_upset_panel <- function(membership, sets, title,
+                             show_legend = FALSE) {
+  
+  # --------------------------------------------------------------
+  # UPPER BARS: TAXONOMIC UNIQUENESS
+  # --------------------------------------------------------------
+  # Stack marker contributions within each intersection.
+  # Colours represent 12S, 16S, and Combined.
+  # Numbers above bars indicate total intersection sizes.
+  
+  intersection_bar <- ComplexUpset::intersection_size(
+    mapping = ggplot2::aes(fill = Marker_category),
+    counts = TRUE,
+    text = list(size = 2.6)
+  ) +
+    ggplot2::scale_fill_manual(
+      values = upset_marker_colours,
+      limits = names(upset_marker_colours),
+      drop = FALSE,
+      name = "Detected by",
+      guide = if (show_legend) "legend" else "none"
+    ) +
+    ggplot2::labs(
+      y = "Taxonomic uniqueness"
+    )
+  
+  # --------------------------------------------------------------
+  # LEFT BARS: TAXONOMIC RICHNESS
+  # --------------------------------------------------------------
+  # Show the total number of taxa detected within each set.
+  
+  set_size_bar <- ComplexUpset::upset_set_size() +
+    ggplot2::labs(
+      y = "Taxonomic richness"
+    )
+  
+  # --------------------------------------------------------------
+  # BUILD THE COMPLETE UPSET PLOT
+  # --------------------------------------------------------------
+  
+  ComplexUpset::upset(
+    membership,
+    intersect = sets,
+    min_size = 1,
+    sort_intersections_by = "cardinality",
+    sort_sets = FALSE,
+    width_ratio = 0.20,
+    name = "Group",
+    
+    base_annotations = list(
+      "Taxonomic uniqueness" = intersection_bar
+    ),
+    
+    set_sizes = set_size_bar
+  ) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        size = 14
+      ),
+      text = ggplot2::element_text(size = 10),
+      legend.position = if (show_legend) "right" else "none",
+      legend.title = ggplot2::element_text(
+        size = 9,
+        face = "bold"
+      ),
+      legend.text = ggplot2::element_text(size = 8),
+      legend.key.size = grid::unit(0.35, "cm"),
+      plot.margin = ggplot2::margin(8, 8, 8, 8)
+    )
+}
+
+# ================================================================
+# CREATE PANELS G, H, AND I
+# ================================================================
+
+# --------------------------------------------------------------
+# PANEL G: MARKER OVERLAP
+# --------------------------------------------------------------
+# Reverse the input order so that ComplexUpset displays:
+# Top    = 12S
+# Bottom = 16S
+#
+# Keep the marker legend only in this panel.
+
+panel_G <- make_upset_panel(
+  marker_membership,
+  c("16S", "12S"),
+  "Marker overlap",
+  show_legend = TRUE
+)
+
+# --------------------------------------------------------------
+# PANEL H: VEGETATION HEIGHT OVERLAP
+# --------------------------------------------------------------
+# Use the same marker colours without a duplicated legend.
+
+panel_H <- make_upset_panel(
+  height_membership,
+  height_levels,
+  "Height overlap",
+  show_legend = FALSE
+)
+
+# --------------------------------------------------------------
+# PANEL I: LOCATION OVERLAP
+# --------------------------------------------------------------
+# Use the same marker colours without a duplicated legend.
+
+panel_I <- make_upset_panel(
+  location_membership,
+  location_levels,
+  "Location overlap",
+  show_legend = FALSE
+)
+
+# 11. COMBINE INTO ONE NINE-PANEL FIGURE ------------------------------------
+# ComplexUpset is itself a composite ggplot; wrap it so automatic tags do
+# not label internal elements. Explicit plot tags are used for A-F.
+# G/H/I are tagged using a narrow title overlay to avoid internal tag issues.
+wrap_upset <- function(plot, tag) {
+  tag_plot <- ggplot2::ggplot() +
+    ggplot2::annotate('text', x = 0, y = 1, label = tag,
+                      hjust = 0, vjust = 1, fontface = 'bold', size = 6) +
+    ggplot2::xlim(0, 1) + ggplot2::ylim(0, 1) + ggplot2::theme_void()
+  patchwork::wrap_elements(full = plot) +
+    patchwork::inset_element(tag_plot, left = 0.005, bottom = 0.89,
+                             right = 0.08, top = 0.995, align_to = 'full')
+}
+
+add_tag <- function(plot, tag) {
+  plot + ggplot2::labs(tag = tag) +
+    ggplot2::theme(plot.tag = ggplot2::element_text(face = 'bold', size = 19),
+                   plot.tag.position = c(0.01, 0.99))
+}
+
+# Arrange richness, coverage, and UpSet plots from top to bottom.
+richness_row <- add_tag(panel_A, "A") |
+  add_tag(panel_B, "B") |
+  add_tag(panel_C, "C")
+
+# Tag the main panels before inserting the zoom plots.
+panel_E_zoom <- add_coverage_inset(
+  add_tag(panel_E, "E"), height_coverage, height_colours,
+  height_zoom, height_coverage_zoom
+)
+panel_F_zoom <- add_coverage_inset(
+  add_tag(panel_F, "F"), location_coverage, location_colours,
+  location_zoom, location_coverage_zoom
+)
+coverage_row <- add_tag(panel_D, "D") | panel_E_zoom | panel_F_zoom
+
+overlap_row <- wrap_upset(panel_G, "G") |
+  wrap_upset(panel_H, "H") |
+  wrap_upset(panel_I, "I")
+
+# Give the UpSet row more space for its bars and intersection matrix.
+figure_ABCDEFGHI <- (richness_row / coverage_row / overlap_row) +
+  patchwork::plot_layout(heights = c(1, 1, 1.22))
+
+# Explain how to read the iNEXT curves.
+curve_key <- paste(
+  "Solid lines: rarefaction",
+  "Dashed lines: extrapolation",
+  "Shading: 95% CI",
+  sep = "   |   "
+)
+figure_ABCDEFGHI <- figure_ABCDEFGHI +
+  patchwork::plot_annotation(
+    caption = curve_key,
+    theme = theme(
+      plot.caption = element_text(hjust = 0.5, size = 11, colour = "grey30")
+    )
+  )
+
+print(figure_ABCDEFGHI)
+
+# 12. EXPORT PUBLICATION FIGURES -------------------------------------------
+# PDF preserves vector graphics; PNG is exported at 600 dpi.
+save_figure <- function(plot, basename, width, height) {
+  ggplot2::ggsave(file.path(output_dir, paste0(basename, '.png')),
+                  plot = plot, width = width, height = height, units = 'in',
+                  dpi = 600, bg = 'white', limitsize = FALSE)
+  ggplot2::ggsave(file.path(output_dir, paste0(basename, '.pdf')),
+                  plot = plot, width = width, height = height, units = 'in',
+                  bg = 'white', limitsize = FALSE)
+}
+# Save the complete A-I figure.
+save_figure(figure_ABCDEFGHI, "FigureS2_iNEXT_UpSet_Coverage_Insets", 20, 18)
+
+# 13. EXPORT REPRODUCIBLE ANALYSIS TABLES ----------------------------------
+summarise_assemblages <- function(x, factor_name) {
+  data.frame(
+    Factor = factor_name,
+    Group = names(x),
+    Sampling_units = vapply(x, ncol, integer(1)),
+    Zero_detection_units = vapply(x, function(z) sum(colSums(z) == 0), integer(1)),
+    Observed_taxa = vapply(x, function(z) sum(rowSums(z) > 0), integer(1)),
+    row.names = NULL
+  )
+}
+
+analysis_summary <- dplyr::bind_rows(
+  summarise_assemblages(marker_list, 'Marker'),
+  summarise_assemblages(height_list, 'Height'),
+  summarise_assemblages(location_list, 'Location')
+)
+
+# Save the input summaries, memberships, and fitted curves as CSV files.
+write.csv(
+  analysis_summary,
+  file.path(output_dir, "TableS2_Analysis_Summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  marker_membership,
+  file.path(output_dir, "TableS2_UpSet_Marker_Membership.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  height_membership,
+  file.path(output_dir, "TableS2_UpSet_Height_Membership.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  location_membership,
+  file.path(output_dir, "TableS2_UpSet_Location_Membership.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  marker_curves,
+  file.path(output_dir, "TableS2_iNEXT_Marker_Curves.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  height_curves,
+  file.path(output_dir, "TableS2_iNEXT_Height_Curves.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  location_curves,
+  file.path(output_dir, "TableS2_iNEXT_Location_Curves.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  marker_coverage,
+  file.path(output_dir, "TableS2_iNEXT_Marker_Coverage.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  height_coverage,
+  file.path(output_dir, "TableS2_iNEXT_Height_Coverage.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  location_coverage,
+  file.path(output_dir, "TableS2_iNEXT_Location_Coverage.csv"),
+  row.names = FALSE
+)
+
+print(analysis_summary, row.names = FALSE)
+message('Figure S2 complete. Files saved in: ', normalizePath(output_dir))
