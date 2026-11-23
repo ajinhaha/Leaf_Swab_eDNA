@@ -1,0 +1,365 @@
+# Supplementary Figure S3. Taxon richness by vegetation height
+# Open this script in RStudio and click Source.
+# Each plot has one Lower, one Middle, and one Upper leaf swab.
+
+# 01. Load packages -------------------------------------------------------
+
+# Run this line once if you need to install the packages.
+# install.packages(c("readxl", "dplyr", "tidyr", "ggplot2"))
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 02. Set input and output paths ------------------------------------------
+
+# A dot means the current working directory. Check it with getwd().
+data_dir <- "."
+otu_file <- file.path(data_dir, "Supplementary Table.xlsx")
+output_dir <- file.path(data_dir, "figures", "Figure_S3")
+
+if (!file.exists(otu_file)) {
+  stop("Cannot find the workbook: ", otu_file)
+}
+
+# Set the height order and labels used in the figure.
+heights <- c("Lower", "Middle", "Upper")
+height_labels <- c("Lower\n(<1 m)", "Middle\n(1.3–1.5 m)", "Upper\n(2–2.5 m)")
+
+# 03. Read the OTU worksheets --------------------------------------------
+
+# Check the worksheet names before importing the two markers.
+sheets <- c("S1 - 12S OTU", "S2 - 16S OTU")
+missing_sheets <- setdiff(sheets, excel_sheets(otu_file))
+
+if (length(missing_sheets) > 0L) {
+  stop("Missing worksheets: ", paste(missing_sheets, collapse = ", "))
+}
+
+# Read each marker table and trim spaces from column names.
+otu_12S <- read_excel(otu_file, sheet = sheets[1])
+otu_16S <- read_excel(otu_file, sheet = sheets[2])
+names(otu_12S) <- trimws(names(otu_12S))
+names(otu_16S) <- trimws(names(otu_16S))
+
+# 04. Identify and pair the biological swabs -------------------------------
+
+# Sample names contain the site, height, and plot suffix.
+# For example, SWN_Lower_01 and SWN_Middle_01 both belong to SWN_01.
+sample_pattern <- "^(SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_(.+)$"
+
+# Use sample columns from both markers. Control columns do not match.
+swabs_12S <- grep(sample_pattern, names(otu_12S), value = TRUE)
+swabs_16S <- grep(sample_pattern, names(otu_16S), value = TRUE)
+swabs <- sort(union(swabs_12S, swabs_16S))
+
+if (!length(swabs)) {
+  stop("No biological sample columns found. Check the sample names.")
+}
+
+# Remove the height from the sample name to extract the plot ID.
+richness <- tibble(
+  SampleID = swabs,
+  PlotID = sub(sample_pattern, "\\1_\\3", swabs),
+  Height = factor(sub(sample_pattern, "\\2", swabs), levels = heights)
+)
+
+# Check that every plot has exactly one swab at each height.
+pair_counts <- table(richness$PlotID, richness$Height)
+bad_plots <- rownames(pair_counts)[rowSums(pair_counts != 1L) > 0L]
+
+if (length(bad_plots) > 0L) {
+  stop("Check missing or duplicate heights in: ",
+       paste(bad_plots, collapse = ", "))
+}
+
+# Flag a change from the expected 96 plots without blocking complete pairs.
+if (nrow(pair_counts) != 96L) {
+  warning("Expected 96 plots but found ", nrow(pair_counts), ".")
+}
+
+# 05. Count distinct taxa per swab ----------------------------------------
+
+# Use the same exclusions and taxon names as the richness workflow.
+exclude_notes <- paste(
+  "Control", "No_Borneo_Record", "No_Taxa", "Below_Genus",
+  "NUMTs", "Human", "Domestic_Animal",
+  sep = "|"
+)
+
+# Clean empty or missing taxon names.
+clean_name <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "NaN", "NULL")] <- NA_character_
+  x
+}
+
+# Convert counts to presence or absence for one marker.
+marker_detections <- function(otu, marker) {
+  # Check for the columns needed to assign and filter taxa.
+  missing_columns <- setdiff(c("Genus", "Species", "Note"), names(otu))
+
+  if (length(missing_columns) > 0L) {
+    stop(marker, " is missing: ", paste(missing_columns, collapse = ", "))
+  }
+
+  # Remove excluded rows, then use genus when species is unavailable.
+  otu <- otu %>%
+    filter(!grepl(exclude_notes, coalesce(as.character(Note), ""),
+                  ignore.case = TRUE)) %>%
+    mutate(
+      Genus = clean_name(Genus),
+      Species = clean_name(Species),
+      Taxon = coalesce(
+        Species,
+        if_else(is.na(Genus), NA_character_, paste0(Genus, "_sp."))
+      )
+    ) %>%
+    filter(!is.na(Taxon))
+
+  # Treat swabs absent from this marker table as having no detections here.
+  for (swab in setdiff(swabs, names(otu))) {
+    otu[[swab]] <- rep(0, nrow(otu))
+  }
+
+  # Convert blank count cells to zero and flag invalid entries.
+  for (swab in swabs) {
+    values <- trimws(as.character(otu[[swab]]))
+    values[is.na(values) | values == ""] <- "0"
+    counts <- suppressWarnings(as.numeric(values))
+
+    if (any(!is.finite(counts) | counts < 0)) {
+      stop("Invalid read count in ", marker, " / ", swab)
+    }
+
+    otu[[swab]] <- counts > 0
+  }
+
+  # Keep the taxon and the presence/absence columns.
+  select(otu, Taxon, all_of(swabs))
+}
+
+# Count a taxon only once per swab, even if both markers detect it.
+detections <- bind_rows(
+  marker_detections(otu_12S, "12S"),
+  marker_detections(otu_16S, "16S")
+) %>%
+  group_by(Taxon) %>%
+  summarise(across(all_of(swabs), any), .groups = "drop")
+
+# Retain all biological swabs, including those with zero detections.
+richness$Richness <- unname(colSums(detections[, swabs, drop = FALSE]))
+
+# 06. Summarise richness and run paired Wilcoxon tests ---------------------
+
+# Calculate the mean and median richness at each height.
+height_summary <- richness %>%
+  group_by(Height) %>%
+  summarise(
+    n_swabs = n(),
+    mean_richness = mean(Richness),
+    median_richness = median(Richness),
+    .groups = "drop"
+  )
+
+# Put the three observations from each plot on the same row.
+paired <- richness %>%
+  select(PlotID, Height, Richness) %>%
+  pivot_wider(names_from = Height, values_from = Richness)
+
+# Name the three comparisons in the order used for the signed ranks.
+comparisons <- list(
+  c("Lower", "Middle"),
+  c("Lower", "Upper"),
+  c("Middle", "Upper")
+)
+
+# Compare two heights using swabs paired by plot.
+test_pair <- function(pair) {
+  differences <- paired[[pair[1]]] - paired[[pair[2]]]
+  n_nonzero <- sum(differences != 0)
+
+  # Use the normal approximation for integer differences with ties.
+  # If every pair is tied, there are no ranks and the P value is 1.
+  statistic <- 0
+  p_value <- 1
+
+  if (n_nonzero > 0L) {
+    test <- wilcox.test(differences, mu = 0, exact = FALSE)
+    statistic <- unname(test$statistic)
+    p_value <- test$p.value
+  }
+
+  tibble(
+    comparison = paste(pair, collapse = " vs "),
+    n_plots = nrow(paired),
+    n_nonzero = n_nonzero,
+    median_difference = median(differences),
+    V = statistic,
+    p_raw = p_value
+  )
+}
+
+# Apply the Holm correction across all three comparisons.
+results <- bind_rows(lapply(comparisons, test_pair)) %>%
+  mutate(p_holm = p.adjust(p_raw, method = "holm"))
+
+# Print the summaries and tests in the R console.
+print(height_summary)
+print(results, width = Inf)
+
+# 07. Draw Supplementary Figure S3 ----------------------------------------
+
+# Pool the three swabs within each plot and count each taxon once.
+plot_ids <- unique(richness$PlotID)
+pooled_counts <- vapply(plot_ids, function(plot_id) {
+  plot_swabs <- richness$SampleID[richness$PlotID == plot_id]
+  present <- rowSums(detections[, plot_swabs, drop = FALSE]) > 0
+  sum(present)
+}, integer(1))
+
+combined <- tibble(
+  PlotID = plot_ids,
+  Richness = unname(pooled_counts)
+)
+
+# Add the plot-level richness as a fourth group for display.
+plot_groups <- c(heights, "Combined")
+plot_data <- bind_rows(
+  select(richness, PlotID, Height, Richness),
+  mutate(combined, Height = "Combined")
+)
+plot_data$Position <- match(plot_data$Height, plot_groups)
+
+# Compute the mean shown beside each diamond.
+plot_means <- plot_data %>%
+  group_by(Position) %>%
+  summarise(mean_richness = mean(Richness), .groups = "drop")
+
+# Use grey for the pooled group.
+height_colours <- c(
+  Lower = "#CC79A7",
+  Middle = "#E69F00",
+  Upper = "#009E73",
+  Combined = "#595959"
+)
+
+# Place brackets above the highest observed richness.
+bracket_offset <- max(1, max(richness$Richness) * 0.12)
+brackets <- tibble(
+  left = c(1, 1, 2),
+  right = c(2, 3, 3),
+  height = max(richness$Richness) + bracket_offset * c(1, 3, 2),
+  p_value = results$p_holm
+)
+
+# Match the stars in the example using Holm-adjusted P values.
+brackets <- brackets %>%
+  mutate(
+    label = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    midpoint = (left + right) / 2,
+    tip = height - 0.2 * bracket_offset,
+    label_height = height + 0.1 * bracket_offset
+  )
+
+# Show the distribution for each height and for the pooled plots.
+figure_s3 <- ggplot(plot_data, aes(x = Position, y = Richness)) +
+  geom_violin(
+    aes(group = Height, fill = Height, colour = Height),
+    trim = TRUE, scale = "width", width = 0.75, alpha = 0.38
+  ) +
+  # Overlay a narrow boxplot to mark the median and quartiles.
+  geom_boxplot(
+    aes(group = Height),
+    fill = "white", width = 0.15, outlier.shape = NA
+  ) +
+  # Spread tied counts horizontally so repeated values are visible.
+  geom_point(
+    aes(colour = Height),
+    position = position_jitter(width = 0.09, height = 0, seed = 42),
+    alpha = 0.38, size = 1.4
+  ) +
+  # Mark the mean with a white diamond and a numeric label.
+  geom_point(
+    data = plot_means,
+    aes(y = mean_richness),
+    shape = 23, fill = "white", size = 3.4
+  ) +
+  geom_text(
+    data = plot_means,
+    aes(y = mean_richness, label = sprintf("%.2f", mean_richness)),
+    nudge_x = 0.09, hjust = 0, fontface = "bold", size = 3.4
+  ) +
+  # Draw the horizontal brackets, their tips, and significance labels.
+  geom_segment(
+    data = brackets,
+    aes(x = left, xend = right, y = height, yend = height),
+    inherit.aes = FALSE
+  ) +
+  geom_segment(
+    data = brackets,
+    aes(x = left, xend = left, y = height, yend = tip),
+    inherit.aes = FALSE
+  ) +
+  geom_segment(
+    data = brackets,
+    aes(x = right, xend = right, y = height, yend = tip),
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = brackets,
+    aes(x = midpoint, y = label_height, label = label),
+    inherit.aes = FALSE, vjust = 0, fontface = "bold", size = 3.8
+  ) +
+  scale_x_continuous(
+    breaks = seq_along(plot_groups),
+    labels = c(height_labels, "Combined\n(all three swabs)")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.03, 0.1))) +
+  scale_fill_manual(values = height_colours) +
+  scale_colour_manual(values = height_colours) +
+  labs(
+    x = "Vegetation height",
+    y = "Number of distinct taxa detected"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+# 08. Save the figure and tables ------------------------------------------
+
+# Create the output folder if needed.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save the high-resolution PNG and vector PDF.
+ggsave(
+  file.path(output_dir, "Figure_S3_Paired_Richness.png"),
+  plot = figure_s3, width = 7, height = 4.5, dpi = 600, bg = "white"
+)
+
+ggsave(
+  file.path(output_dir, "Figure_S3_Paired_Richness.pdf"),
+  plot = figure_s3, width = 7, height = 4.5, bg = "white"
+)
+
+# Save the per-swab data, height summary, and test results as CSV files.
+write.csv(richness, file.path(output_dir, "richness_per_swab.csv"),
+          row.names = FALSE)
+write.csv(height_summary, file.path(output_dir, "richness_by_height.csv"),
+          row.names = FALSE)
+write.csv(results, file.path(output_dir, "paired_wilcoxon_tests.csv"),
+          row.names = FALSE)
+
+# Save the pooled richness for each plot.
+write.csv(
+  combined, file.path(output_dir, "richness_combined_by_plot.csv"),
+  row.names = FALSE
+)
+
+# Show where the files were saved.
+message("Outputs saved in ", normalizePath(output_dir))
