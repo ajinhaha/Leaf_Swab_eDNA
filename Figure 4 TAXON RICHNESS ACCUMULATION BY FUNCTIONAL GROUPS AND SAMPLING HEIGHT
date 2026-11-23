@@ -1,0 +1,590 @@
+# =============================================================================
+# LEAF-SWAB eDNA: TAXON RICHNESS ACCUMULATION BY TRAIT AND SAMPLING HEIGHT
+# Open the project in RStudio and click Source to run the full script.
+# =============================================================================
+# Analysis: incidence-based Hill number q=0 (taxon richness), iNEXT.
+# Rows: A Diet; B Body size; C Locomotion.
+# Columns: Lower (<1 m); Middle (1.3–1.5 m); Upper (2–2.5 m).
+# IMPORTANT: Upper is only relabelled; original sample names are unchanged.
+# Outputs: combined 3x3 PNG (600 dpi), vector PDF, curves and CI diagnostics.
+# Confidence intervals are shown only where iNEXT estimates them.
+# =============================================================================
+
+# 01. INSTALL PACKAGES ONCE (uncomment if needed) ------------------------------
+# install.packages(c(
+#   "readxl", "dplyr", "stringr", "ggplot2", "iNEXT", "cowplot", "ggrepel"
+# ))
+
+# Load the packages for Excel import, data preparation, and plotting.
+library(readxl)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(iNEXT)
+library(cowplot)
+
+# 02. SET PROJECT OPTIONS ----------------------------------------------------
+
+# A dot means the current working directory. Use getwd() to check it.
+# Set a different path here if the two Excel files are elsewhere.
+data_dir <- "."
+
+# Set the output folder and create it if needed.
+output_dir <- file.path(data_dir, "figures", "iNEXT_ecological_traits",
+                        "by_height")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Set the seed and bootstrap settings for the iNEXT curves.
+seed <- 123L
+nboot <- 200L
+retry_nboot <- 400L
+conf_level <- 0.95
+knots <- 100L
+
+# Set the order and labels of the figure columns and rows.
+height_levels <- c("Lower", "Middle", "Upper")
+height_labels <- c("Lower (<1 m)", "Middle (1.3–1.5 m)", "Upper (2–2.5 m)")
+trait_names <- c("Diet", "Body_size", "Locomotion")
+
+# 03. READ THE OTU AND TRAIT WORKBOOKS ---------------------------------------
+
+# Set the path to each workbook.
+otu_file <- file.path(data_dir, "Supplementary Table.xlsx")
+traits_file <- file.path(data_dir, "Leaf_swab_taxa_ecological_traits.xlsx")
+
+# Check that both workbooks are in the data folder.
+input_files <- c(otu_file, traits_file)
+missing_files <- input_files[!file.exists(input_files)]
+
+if (length(missing_files) > 0) {
+  missing_names <- paste(missing_files, collapse = ", ")
+  stop("Missing Excel files: ", missing_names)
+}
+
+# Set the exact worksheet names for the two markers.
+sheet_12S <- "S1 - 12S OTU"
+sheet_16S <- "S2 - 16S OTU"
+
+# Check that the OTU workbook contains both worksheets.
+required_sheets <- c(sheet_12S, sheet_16S)
+available_sheets <- excel_sheets(otu_file)
+missing_sheets <- setdiff(required_sheets, available_sheets)
+
+if (length(missing_sheets) > 0) {
+  missing_names <- paste(missing_sheets, collapse = ", ")
+  stop("Missing worksheets in Supplementary Table.xlsx: ", missing_names)
+}
+
+# Read the 12S and 16S OTU tables from their respective worksheets.
+otu_12S <- read_excel(otu_file, sheet = sheet_12S)
+otu_16S <- read_excel(otu_file, sheet = sheet_16S)
+
+# Read the ecological traits table from the first worksheet.
+traits_raw <- read_excel(traits_file)
+
+# Trim spaces from column names.
+names(otu_12S) <- trimws(names(otu_12S))
+names(otu_16S) <- trimws(names(otu_16S))
+names(traits_raw) <- trimws(names(traits_raw))
+
+# 04. IDENTIFY THE 288 BIOLOGICAL SAMPLES ------------------------------------
+# Control samples are not selected. Keep samples with zero detections.
+sample_pattern <- "^(SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_.+$"
+sample_columns <- sort(union(
+  grep(sample_pattern, names(otu_12S), value = TRUE),
+  grep(sample_pattern, names(otu_16S), value = TRUE)
+))
+if (!length(sample_columns)) stop("No biological sample columns found.")
+sample_height <- setNames(
+  str_match(sample_columns, "^(?:SWN|BBI|SBJ|KRB|SLP)_(Lower|Middle|Upper)_")[, 2],
+  sample_columns
+)
+print(table(factor(sample_height, levels = height_levels)))
+if (length(sample_columns) != 288L) {
+  warning("Expected 288 biological samples; found ", length(sample_columns))
+}
+
+# 05. CLEAN TAXON NAMES AND COMBINE 12S + 16S -------------------------------
+normalize_taxon <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "NaN", "NULL")] <- NA_character_
+  x
+}
+exclude_notes <- "Control|No_Borneo_Record|No_Taxa|Below_Genus|NUMTs|Human|Domestic_Animal"
+prepare_marker <- function(df, marker) {
+  required <- c("Genus", "Species", "Note")
+  missing_columns <- setdiff(required, names(df))
+  if (length(missing_columns) > 0) {
+    missing_names <- paste(missing_columns, collapse = ", ")
+    stop(marker, " missing columns: ", missing_names)
+  }
+  # Add zero counts for swabs listed only in the other marker table.
+  missing_samples <- setdiff(sample_columns, names(df))
+  for (sample_id in missing_samples) {
+    df[[sample_id]] <- 0
+  }
+  df <- df %>%
+    filter(!str_detect(
+      coalesce(as.character(Note), ""),
+      regex(exclude_notes, ignore_case = TRUE)
+    )) %>%
+    mutate(
+      Genus = normalize_taxon(Genus),
+      Species = normalize_taxon(Species),
+      Taxon = if_else(!is.na(Species), Species,
+                      if_else(!is.na(Genus), paste0(Genus, "_sp."), NA_character_))
+    ) %>%
+    filter(!is.na(Taxon))
+  df[sample_columns] <- lapply(df[sample_columns], function(v) {
+    z <- suppressWarnings(as.numeric(as.character(v)))
+    z[is.na(z)] <- 0
+    if (any(!is.finite(z) | z < 0)) stop("Invalid read counts in ", marker)
+    z
+  })
+  df %>% group_by(Taxon) %>%
+    summarise(across(all_of(sample_columns), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+}
+combined_reads <- bind_rows(
+  prepare_marker(otu_12S, "12S"),
+  prepare_marker(otu_16S, "16S")
+) %>% group_by(Taxon) %>%
+  summarise(across(all_of(sample_columns), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+# 06. JOIN TAXONOMIC ECOLOGICAL TRAITS ---------------------------------------
+find_col <- function(df, candidates) {
+  found <- intersect(candidates, names(df))
+  if (length(found) == 0) {
+    expected <- paste(candidates, collapse = " / ")
+    stop("Trait column not found. Expected: ", expected)
+  }
+  found[1]
+}
+trait_data <- data.frame(
+  Taxon = normalize_taxon(traits_raw[[find_col(traits_raw, "Taxon")]]),
+  Diet = normalize_taxon(traits_raw[[find_col(traits_raw, "Diet")]]),
+  Body_size = normalize_taxon(traits_raw[[find_col(traits_raw,
+                                                   c("Body-size class", "Body_size", "Body size class"))]]),
+  Locomotion = normalize_taxon(traits_raw[[find_col(traits_raw, "Locomotion")]]),
+  stringsAsFactors = FALSE
+) %>% filter(!is.na(Taxon))
+if (anyDuplicated(trait_data$Taxon)) stop("Duplicate Taxon names in trait table.")
+# Correct the two previously identified bat locomotion classifications.
+trait_data$Locomotion[trait_data$Taxon %in%
+                        c("Balionycteris_maculata", "Mops_plicatus")] <- "Chiropteran volant"
+unmatched <- anti_join(combined_reads, trait_data, by = "Taxon")
+write.csv(
+  unmatched %>% select(Taxon),
+  file.path(output_dir, "unmatched_taxa.csv"),
+  row.names = FALSE
+)
+matched <- inner_join(combined_reads, trait_data, by = "Taxon")
+if (!nrow(matched)) stop("No detected taxa matched the trait table.")
+message("Matched taxa: ", nrow(matched), "; unmatched: ", nrow(unmatched))
+incidence <- as.matrix(matched[, sample_columns, drop = FALSE])
+storage.mode(incidence) <- "numeric"
+incidence <- (incidence > 0) * 1L
+rownames(incidence) <- matched$Taxon
+
+# 07. FIXED CATEGORY COLOURS -------------------------------------------------
+trait_palettes <- list(
+  Diet = c(Omnivore = "#4477AA", Insectivore = "#228833",
+           Frugivore = "#CCBB44", Herbivore = "#EE6677",
+           Carnivore = "#AA3377", Other = "#66CCEE"),
+  Body_size = c(Small = "#4477AA", Medium = "#228833", Large = "#EE7733"),
+  Locomotion = c("Avian volant" = "#4477AA",
+                 "Chiropteran volant" = "#AA3377",
+                 Arboreal = "#228833", "Semi-arboreal" = "#CCBB44",
+                 Terrestrial = "#EE7733", Aquatic = "#66CCEE")
+)
+
+# 08. FIT iNEXT BY TRAIT, HEIGHT, AND CATEGORY -------------------------------
+# CRITICAL FIX: iNEXT incidence_raw takes a NAMED LIST of incidence matrices.
+# We extract fit$iNextEst$size_based DIRECTLY, rather than relying on fortify().
+# Each matrix retains all 96 height-specific samples, including empty samples.
+# If bootstrap CI fails, retry with 400 replicates; if still unavailable,
+# retain the valid richness curve and record missing uncertainty honestly.
+all_curves <- list()
+all_summary <- list()
+fit_log <- list()
+idx <- 0L
+
+for (trait_name in trait_names) {
+  categories <- sort(unique(na.omit(matched[[trait_name]])))
+  for (height in height_levels) {
+    hs <- names(sample_height)[sample_height == height]
+    for (category in categories) {
+      idx <- idx + 1L
+      # Select taxa assigned to this trait category.
+      trait_values <- matched[[trait_name]]
+      in_category <- !is.na(trait_values) & trait_values == category
+      taxa <- matched$Taxon[in_category]
+      mat <- incidence[taxa, hs, drop = FALSE]
+      n_detected <- sum(rowSums(mat) > 0)
+      all_summary[[idx]] <- data.frame(
+        Trait = trait_name, Height = height, Assemblage = category,
+        Samples = ncol(mat), Samples_with_detection = sum(colSums(mat) > 0),
+        Observed_taxa = n_detected
+      )
+      if (n_detected == 0L) {
+        fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+                                     Assemblage = category, Attempt = "Skipped", Status = "Zero detections",
+                                     Missing_CI = NA_integer_, Error = "")
+        next
+      }
+      # Use the exact incidence matrix for this category and sampling height.
+      # Remove zero-only taxa for numerical stability, but NOT sample columns.
+      mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+      run_fit <- function(boot, seed_offset = 0L) {
+        set.seed(seed + idx + seed_offset)
+        iNEXT::iNEXT(
+          x = setNames(list(mat), category),
+          q = 0, datatype = "incidence_raw", se = TRUE,
+          conf = conf_level, nboot = boot, knots = knots,
+          endpoint = 2 * ncol(mat)
+        )
+      }
+      err <- ""
+      fit <- tryCatch(run_fit(nboot), error = function(e) {
+        err <<- conditionMessage(e)
+        NULL
+      })
+      extract_curves <- function(obj) {
+        if (is.null(obj) || is.null(obj$iNextEst$size_based)) return(NULL)
+        z <- as.data.frame(obj$iNextEst$size_based)
+        required <- c("Assemblage", "t", "Method", "qD")
+        if (!all(required %in% names(z)))
+          stop("Unexpected iNEXT size_based columns: ", paste(names(z), collapse = ", "))
+        z <- z[is.na(z$Order.q) | z$Order.q == 0, , drop = FALSE]
+        z$CI_lower <- if ("qD.LCL" %in% names(z)) z$qD.LCL else NA_real_
+        z$CI_upper <- if ("qD.UCL" %in% names(z)) z$qD.UCL else NA_real_
+        z
+      }
+      result <- tryCatch(extract_curves(fit), error = function(e) {
+        err <<- paste(err, conditionMessage(e))
+        NULL
+      })
+      attempt <- "Initial (200 bootstraps)"
+      needs_retry <- is.null(result) ||
+        (nrow(result) > 0 && all(is.na(result$CI_lower) | is.na(result$CI_upper)))
+      if (needs_retry) {
+        err_retry <- ""
+        fit2 <- tryCatch(run_fit(retry_nboot, 100000L), error = function(e) {
+          err_retry <<- conditionMessage(e)
+          NULL
+        })
+        result2 <- tryCatch(extract_curves(fit2), error = function(e) {
+          err_retry <<- paste(err_retry, conditionMessage(e))
+          NULL
+        })
+        if (!is.null(result2) && nrow(result2)) result <- result2
+        err <- paste(err, err_retry)
+        attempt <- "Retry (400 bootstraps)"
+      }
+      # Last resort: compute point estimates with se=FALSE, without fake CIs.
+      if (is.null(result) || !nrow(result)) {
+        fit3 <- tryCatch(
+          iNEXT::iNEXT(setNames(list(mat), category), q = 0,
+                       datatype = "incidence_raw", se = FALSE,
+                       knots = knots, endpoint = 2 * ncol(mat)),
+          error = function(e) { err <<- paste(err, conditionMessage(e)); NULL }
+        )
+        result <- tryCatch(extract_curves(fit3), error = function(e) NULL)
+        attempt <- "Point estimates only (no CI)"
+      }
+      if (is.null(result) || !nrow(result)) {
+        fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+                                     Assemblage = category, Attempt = attempt, Status = "FAILED",
+                                     Missing_CI = NA_integer_, Error = trimws(err))
+        warning("FAILED: ", trait_name, " / ", height, " / ", category, ": ", err)
+        next
+      }
+      result$Trait <- trait_name
+      result$Height <- height
+      result$Assemblage <- category
+      result$Curve_type <- result$Method
+      all_curves[[length(all_curves) + 1L]] <- result
+      missing_ci <- sum(is.na(result$CI_lower) | is.na(result$CI_upper))
+      fit_log[[idx]] <- data.frame(Trait = trait_name, Height = height,
+                                   Assemblage = category, Attempt = attempt,
+                                   Status = if (missing_ci == 0) "CI complete" else "CI incomplete",
+                                   Missing_CI = missing_ci, Error = trimws(err))
+      message(sprintf("%-11s | %-6s | %-20s | %s | missing CI: %d",
+                      trait_name, height, category, attempt, missing_ci))
+    }
+  }
+}
+
+# 09. SAVE ANALYSIS RESULTS EVEN IF SOME FITS FAIL ---------------------------
+summary_df <- bind_rows(all_summary)
+log_df <- bind_rows(fit_log)
+write.csv(
+  summary_df,
+  file.path(output_dir, "trait_height_observed_richness.csv"),
+  row.names = FALSE
+)
+write.csv(
+  log_df,
+  file.path(output_dir, "iNEXT_fit_diagnostics.csv"),
+  row.names = FALSE
+)
+if (!length(all_curves)) {
+  stop("No curves produced. Open iNEXT_fit_diagnostics.csv to see the exact errors.")
+}
+curves_df <- bind_rows(all_curves)
+write.csv(
+  curves_df,
+  file.path(output_dir, "ALL_trait_height_richness_curves.csv"),
+  row.names = FALSE
+)
+ci_diag <- curves_df %>%
+  group_by(Trait, Height, Assemblage, Method) %>%
+  summarise(N = n(), Missing_lower = sum(is.na(CI_lower)),
+            Missing_upper = sum(is.na(CI_upper)),
+            Mean_CI_width = if (all(is.na(CI_lower) | is.na(CI_upper))) NA_real_
+            else mean(CI_upper - CI_lower, na.rm = TRUE),
+            .groups = "drop")
+write.csv(
+  ci_diag,
+  file.path(output_dir, "confidence_interval_diagnostics.csv"),
+  row.names = FALSE
+)
+print(ci_diag %>% filter(Trait == "Locomotion", Height == "Middle"), n = Inf)
+
+
+# ================================================================
+# 10. PLOT EACH TRAIT x HEIGHT PANEL
+# ================================================================
+# Requires existing objects: curves_df, trait_palettes, height_labels,
+# height_levels, output_dir. No iNEXT models are rerun.
+
+
+make_panel <- function(trait_name, height, panel_tag = NULL) {
+  dat <- curves_df %>% filter(Trait == trait_name, Height == height)
+  if (nrow(dat) == 0L) stop("No curves for ", trait_name, " / ", height)
+  palette <- trait_palettes[[trait_name]]
+  extra <- setdiff(unique(as.character(dat$Assemblage)), names(palette))
+  if (length(extra)) {
+    warning("Unrecognised ", trait_name, " categories: ", paste(extra, collapse = ", "))
+    palette <- c(palette, setNames(grDevices::hcl.colors(length(extra), "Dark 3"), extra))
+  }
+  dat$Assemblage <- factor(dat$Assemblage, levels = names(palette))
+  lines <- dat %>% filter(Method %in% c("Rarefaction", "Extrapolation"))
+  ribbons <- lines %>% filter(is.finite(CI_lower), is.finite(CI_upper))
+  observed <- dat %>% filter(Method == "Observed")
+
+  # Find the last finite point for each group in this panel.
+  endpoints <- dat %>%
+    filter(is.finite(t), is.finite(qD)) %>%
+    group_by(Assemblage) %>%
+    slice_max(t, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  # Align labels just beyond the longest curve in the panel.
+  last_sample <- max(endpoints$t)
+  label_x <- last_sample * 1.04
+  endpoints$Label <- str_wrap(as.character(endpoints$Assemblage), 14)
+
+  p <- ggplot() +
+    # Draw confidence bands where both interval bounds are available.
+    geom_ribbon(
+      data = ribbons,
+      aes(x = t, ymin = CI_lower, ymax = CI_upper,
+          fill = Assemblage, group = interaction(Assemblage, Method)),
+      alpha = 0.14, colour = NA, show.legend = FALSE
+    ) +
+    # Use solid rarefaction lines and dashed extrapolation lines.
+    geom_line(
+      data = lines,
+      aes(x = t, y = qD, colour = Assemblage, linetype = Method,
+          group = interaction(Assemblage, Method)),
+      linewidth = 1.05, na.rm = TRUE
+    ) +
+    # Mark the observed sampling effort.
+    geom_point(
+      data = observed,
+      aes(x = t, y = qD, colour = Assemblage),
+      size = 2.5, na.rm = TRUE, show.legend = FALSE
+    ) +
+    # Label each curve in its own colour and spread crowded labels vertically.
+    ggrepel::geom_text_repel(
+      data = endpoints,
+      aes(x = t, y = qD, label = Label, colour = Assemblage),
+      nudge_x = label_x - endpoints$t,
+      direction = "y",
+      hjust = 0,
+      size = 3.3,
+      fontface = "bold",
+      min.segment.length = 0,
+      segment.alpha = 0.45,
+      box.padding = 0.2,
+      max.overlaps = Inf,
+      seed = seed,
+      show.legend = FALSE
+    ) +
+    scale_colour_manual(values = palette, guide = "none") +
+    scale_fill_manual(values = palette, guide = "none") +
+    scale_linetype_manual(
+      values = c(Rarefaction = "solid", Extrapolation = "dashed"),
+      guide = "none"
+    ) +
+    # Reserve space for the labels while keeping ticks within sampling effort.
+    scale_x_continuous(
+      breaks = function(limits) {
+        ticks <- pretty(c(0, last_sample))
+        ticks[ticks >= 0 & ticks <= last_sample]
+      },
+      expand = expansion(mult = c(0.02, 0.25))
+    ) +
+    labs(
+      # Show the height headings only in the top row (Diet).
+      title = if (trait_name == "Diet") {
+        height_labels[match(height, height_levels)]
+      } else {
+        NULL
+      },
+      
+      # Show the x-axis title only in row C.
+      x = if (trait_name == "Locomotion") "Number of leaf-swab samples",
+      
+      # Show the y-axis title only in the left column.
+      y = if (height == "Lower") "Taxon richness"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey92", linewidth = 0.2),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16,
+                                margin = margin(b = 8)),
+      axis.title.x = element_text(size = 14, margin = margin(t = 8)),
+      axis.title.y = element_text(size = 14, margin = margin(r = 8)),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      plot.margin = margin(8, 8, 8, 8)
+    )
+
+  if (!is.null(panel_tag)) {
+    p <- p + labs(tag = panel_tag) +
+      theme(plot.tag = element_text(face = "bold", size = 22))
+  }
+  p
+}
+
+# ================================================================
+# 11. COMBINE PANELS AND ADD ONE SHARED CURVE KEY
+# ================================================================
+
+# Place the three height panels for each trait side by side.
+# Build one row with a heading above three equal-width panels.
+build_row <- function(trait_name, tag) {
+  # Create the three plots.
+  panels <- cowplot::plot_grid(
+    make_panel(trait_name, "Lower"),
+    make_panel(trait_name, "Middle"),
+    make_panel(trait_name, "Upper"),
+    ncol = 3,
+    align = "hv",
+    axis = "tblr"
+  )
+  
+  # Draw the row heading separately from the plots.
+  heading <- cowplot::ggdraw() +
+    cowplot::draw_label(
+      tag,
+      x = 0.008,
+      hjust = 0,
+      fontface = "bold",
+      size = 17
+    )
+  
+  # Give most of the row height to the plots.
+  cowplot::plot_grid(
+    heading,
+    panels,
+    ncol = 1,
+    rel_heights = c(0.07, 1)
+  )
+}
+
+
+# ================================================================
+# CREATE THREE TRAIT ROWS
+# ================================================================
+
+# Add the functional-group heading beside each row letter.
+row_diet <- build_row("Diet", "A  Diet")
+row_body <- build_row("Body_size", "B  Body-size class")
+row_locomotion <- build_row("Locomotion", "C  Locomotion")
+
+
+# ================================================================
+# COMBINE THREE ROWS INTO ONE FIGURE
+# ================================================================
+
+combined_panels <- cowplot::plot_grid(
+  row_diet,
+  row_body,
+  row_locomotion,
+  ncol = 1,
+  rel_heights = c(1, 1, 1)
+)
+
+# Explain the line types and shading once, below all nine panels.
+curve_key <- paste(
+  "Solid lines: rarefaction (interpolation)",
+  "Dashed lines: extrapolation",
+  paste0("Shading: ", 100 * conf_level, "% CI"),
+  sep = "   |   "
+)
+
+# Place the panels above the shared curve key.
+combined_figure <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    combined_panels,
+    x = 0,
+    y = 0.035,
+    width = 1,
+    height = 0.96
+  ) +
+  cowplot::draw_label(
+    curve_key,
+    x = 0.5,
+    y = 0.018,
+    size = 12,
+    colour = "grey30"
+  )
+
+# ================================================================
+# 12. SAVE FIGURES
+# ================================================================
+
+# Set both paths here so exports work in a fresh R session.
+figure_name <- "iNEXT_Taxon_Richness_By_Trait_and_Height"
+png_path <- file.path(output_dir, paste0(figure_name, ".png"))
+pdf_path <- file.path(output_dir, paste0(figure_name, ".pdf"))
+
+# Save the 600-dpi PNG.
+ggsave(
+  png_path,
+  plot = combined_figure,
+  width = 17,
+  height = 16,
+  units = "in",
+  dpi = 600,
+  bg = "white",
+  limitsize = FALSE
+)
+
+# Save the vector PDF.
+ggsave(
+  pdf_path,
+  plot = combined_figure,
+  width = 17,
+  height = 16,
+  units = "in",
+  device = grDevices::cairo_pdf,
+  bg = "white",
+  limitsize = FALSE
+)
+
+print(combined_figure)
+shell.exec(normalizePath(png_path, mustWork = TRUE))
